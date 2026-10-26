@@ -167,9 +167,6 @@ log:
       secret_key: ci-placeholder
       min_ttl: 600
   magic_dns: true'''))
-            docker('run', '--rm', '--network', 'none', '-v', str(new)+':/config:ro', IMAGE,
-                   '--config', '/config/config.yaml', 'configtest')
-            check('tencentcloud_provider_config', True)
             server = start(OLD, 'old', old)
             user = json.loads(cli(server, 'users', 'create', 'ci', '-o', 'json'))
             auth = json.loads(cli(server, 'preauthkeys', 'create', '--user', str(user['id']), '--expiration', '24h', '--reusable', '-o', 'json'))
@@ -188,6 +185,7 @@ log:
             backup = run(['docker', 'exec', PREFIX+'-db', 'pg_dump', '-U', 'netcat', '-d', 'headscale', '-Fc']).stdout
             REPORT['snapshot_sha256'] = hashlib.sha256(backup).hexdigest()
             server = start(IMAGE, 'candidate', new)
+            check('tencentcloud_provider_config', True)
             after = snapshot()
             check('nodes_users_routes_tags_preserved', all(before[t] == after[t] for t in ['nodes', 'users', 'policies']))
             check('legacy_credential_tables_removed', all(t not in after for t in ['api_keys', 'pre_auth_keys', 'oauth_clients', 'oauth_access_tokens']))

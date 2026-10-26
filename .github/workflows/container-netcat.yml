@@ -49,7 +49,7 @@ jobs:
             --image-label="org.opencontainers.image.revision=${GITHUB_SHA}" \
             --image-annotation="org.opencontainers.image.source=https://github.com/netcat-ai/headscale" \
             --image-refs="$RUNNER_TEMP/image.txt" ./cmd/headscale
-          image="$(cat "$RUNNER_TEMP/image.txt")"
+          image="$(grep "^${KO_DOCKER_REPO}:sha-${GITHUB_SHA}@sha256:" "$RUNNER_TEMP/image.txt")"
           image="${KO_DOCKER_REPO}@${image##*@}"
           [[ "$image" =~ ^ghcr.io/netcat-ai/headscale@sha256:[0-9a-f]{64}$ ]]
           printf '%s\n' "$image" > "$RUNNER_TEMP/image.txt"
