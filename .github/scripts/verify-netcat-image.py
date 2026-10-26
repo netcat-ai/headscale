@@ -71,7 +71,8 @@ def start(image, name, directory):
         if r.returncode == 0:
             return name
         if docker('inspect', '-f', '{{.State.Running}}', name) != 'true':
-            raise RuntimeError('Server exited: '+docker('logs', '--tail', '25', name))
+            logs = run(['docker', 'logs', '--tail', '25', name], check=False)
+            raise RuntimeError('Server exited: '+(logs.stdout+logs.stderr).decode(errors='replace'))
         time.sleep(1)
     raise RuntimeError('Server readiness timed out: '+name)
 
@@ -115,6 +116,7 @@ def main():
             root = Path(tmp)
             old = root/'old'; old.mkdir()
             config = '''server_url: http://127.0.0.1:8080
+disable_check_updates: true
 listen_addr: 0.0.0.0:8080
 grpc_listen_addr: 127.0.0.1:50443
 metrics_listen_addr: 127.0.0.1:9090
@@ -148,11 +150,11 @@ policy:
   mode: file
   path: /config/policy.hujson
 log:
-  level: error
+  level: info
   format: json
 '''
             (old/'config.yaml').write_text(config)
-            (old/'policy.hujson').write_text(json.dumps({'tagOwners': {'tag:server': ['ci']}, 'acls': [{'action': 'accept', 'src': ['*'], 'dst': ['*:*']}]}))
+            (old/'policy.hujson').write_text(json.dumps({'tagOwners': {'tag:server': ['ci@']}, 'acls': [{'action': 'accept', 'src': ['*'], 'dst': ['*:*']}]}))
             (old/'derp.yaml').write_text('regions:\n  999:\n    regionid: 999\n    regioncode: isolated\n    regionname: isolated\n    nodes:\n      - name: isolated\n        regionid: 999\n        hostname: 127.0.0.1\n        ipv4: 127.0.0.1\n        derpport: 9\n')
             new = root/'new'; new.mkdir()
             for f in old.iterdir():
