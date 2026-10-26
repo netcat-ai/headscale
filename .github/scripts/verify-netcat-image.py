@@ -62,7 +62,7 @@ def start(image, name, directory):
     entry = json.loads(docker('image', 'inspect', image))[0]['Config']['Entrypoint']
     ENTRIES[name] = entry
     CONTAINERS.append(name)
-    docker('run', '-d', '--name', name, '--network', PREFIX, '-p', '127.0.0.1::8080',
+    docker('run', '-d', '--name', name, '--network', PREFIX,
            '-v', str(directory)+':/config:ro', '--tmpfs', '/state:rw,mode=1777',
            image, '--config', '/config/config.yaml', 'serve')
     for _ in range(90):
@@ -84,7 +84,8 @@ def stop(name):
 
 
 def api_users(name, key):
-    binding = docker('port', name, '8080/tcp')
+    info = json.loads(docker('inspect', name))[0]
+    binding = info['NetworkSettings']['Networks'][PREFIX]['IPAddress'] + ':8080'
     req = urllib.request.Request('http://'+binding+'/api/v1/user', headers={'Authorization': 'Bearer '+key})
     with urllib.request.urlopen(req, timeout=10) as response:
         return response.status == 200 and len(json.load(response)['users']) == 1
