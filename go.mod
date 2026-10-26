@@ -32,6 +32,7 @@ require (
 	github.com/libdns/libdns v1.1.1
 	github.com/libdns/powerdns v0.1.4
 	github.com/libdns/rfc2136 v1.0.1
+	github.com/libdns/tencentcloud v1.4.3
 	github.com/mholt/acmez/v3 v3.1.7
 	github.com/miekg/dns v1.1.73
 	github.com/oapi-codegen/runtime v1.7.0

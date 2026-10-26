@@ -377,12 +377,20 @@ dns:
     # Defaults to 1.1.1.1 and 8.8.8.8.
     # resolvers: []
 
-    # acmedns, cloudflare, gigahost, hetzner, powerdns or rfc2136. The other
+    # acmedns, cloudflare, gigahost, hetzner, powerdns, rfc2136 or tencentcloud. The other
     # keys are settings of that provider; add _path to a key to read it from
     # a file.
     # provider:
     #   name: cloudflare
     #   api_token_path: /run/credentials/headscale.service/cloudflare-token
+    #
+    # TencentCloud DNSPod uses Tencent Cloud API credentials (not a legacy
+    # DNSPod ID,token). Optional fields: session_token and region.
+    # provider:
+    #   name: tencentcloud
+    #   secret_id_path: /run/credentials/headscale.service/tencent-secret-id
+    #   secret_key_path: /run/credentials/headscale.service/tencent-secret-key
+    #   min_ttl: 600 # seconds; default for DNSPod's free plan
     #
     # acmedns needs a registration per certificate name under config, and
     # each _acme-challenge name CNAMEd to its registration's fulldomain. A

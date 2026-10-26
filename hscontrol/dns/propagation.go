@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	mdns "github.com/miekg/dns"
 	"github.com/rs/zerolog/log"
 )
 
@@ -70,7 +71,7 @@ func (c txtChecker) wait(ctx context.Context, fqdn, value string) error {
 
 	recursive := resolverAt(c.resolvers...)
 
-	target, err := c.cnameTarget(ctx, recursive, fqdn)
+	target, err := c.cnameTarget(ctx, fqdn)
 	if err != nil {
 		return err
 	}
@@ -160,12 +161,14 @@ func (c txtChecker) wait(ctx context.Context, fqdn, value string) error {
 // cnameTarget follows the CNAME chain from fqdn, as the CA does, and
 // returns its last name, or fqdn without one. A CNAME delegates the
 // challenge to another zone, as for acme-dns, sometimes through more.
-func (c txtChecker) cnameTarget(ctx context.Context, r *net.Resolver, fqdn string) (string, error) {
+func (c txtChecker) cnameTarget(ctx context.Context, fqdn string) (string, error) {
 	chain := []string{fqdn}
 
 	for {
-		// Go reports only the first target of a chain.
-		target, err := r.LookupCNAME(ctx, fqdn)
+		// Follow only aliases returned for TXT, the query the CA uses.
+		// Some providers synthesize a wildcard for CNAME queries even
+		// when an exact TXT record exists at the challenge name.
+		target, err := c.txtTarget(ctx, fqdn)
 		if isNotFound(err) || err == nil && strings.EqualFold(target, fqdn) {
 			return fqdn, nil
 		}
@@ -185,6 +188,41 @@ func (c txtChecker) cnameTarget(ctx context.Context, r *net.Resolver, fqdn strin
 		chain = append(chain, target)
 		fqdn = target
 	}
+}
+
+// txtTarget returns the first alias in a TXT response, or the original name.
+// Querying the response explicitly preserves CNAME delegation without mistaking
+// a provider's type-specific wildcard answer for the TXT record's destination.
+func (c txtChecker) txtTarget(ctx context.Context, name string) (string, error) {
+	query := new(mdns.Msg)
+	query.SetQuestion(name, mdns.TypeTXT)
+	var lastErr error
+
+	for _, addr := range c.resolvers {
+		qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		client := &mdns.Client{Timeout: 5 * time.Second}
+		answer, _, err := client.ExchangeContext(qctx, query, addr)
+		if err == nil && answer.Truncated {
+			client.Net = "tcp"
+			answer, _, err = client.ExchangeContext(qctx, query, addr)
+		}
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if answer.Rcode != mdns.RcodeSuccess && answer.Rcode != mdns.RcodeNameError {
+			lastErr = fmt.Errorf("TXT lookup through %s: %s", addr, mdns.RcodeToString[answer.Rcode])
+			continue
+		}
+		for _, record := range answer.Answer {
+			if alias, ok := record.(*mdns.CNAME); ok && strings.EqualFold(alias.Hdr.Name, name) {
+				return alias.Target, nil
+			}
+		}
+		return name, nil
+	}
+	return "", lastErr
 }
 
 // nameserversOf returns the nameservers of the closest enclosing name of

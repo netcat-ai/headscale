@@ -235,7 +235,7 @@ func (c *Challenges) show(k challengeKey) time.Time {
 	at := time.Now()
 
 	for other, v := range c.values {
-		expired := v.shownAt.Add(ChallengeTTL + caLookupDelay)
+		expired := v.shownAt.Add(max(ChallengeTTL, v.record.RR().TTL) + caLookupDelay)
 		if other.fqdn == k.fqdn && other != k && expired.After(at) {
 			at = expired
 		}
@@ -243,6 +243,11 @@ func (c *Challenges) show(k challengeKey) time.Time {
 
 	if v, ok := c.values[k]; ok {
 		v.shownAt = at
+		// A provider may require a TTL longer than the default lifetime.
+		// Keep this value alive while waiting for the previous RRset's cache.
+		if until := at.Add(c.lifetime); until.After(v.expires) {
+			v.expires = until
+		}
 	}
 
 	return at

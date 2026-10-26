@@ -43,6 +43,47 @@ If you need to change the ip and/or port used by headscale for the Let's Encrypt
 
 For `TLS-ALPN-01`, headscale listens on the ip:port combination defined in `listen_addr`. Let's Encrypt will _only_ connect to port 443 for the validation callback, so if `listen_addr` is not set to port 443, something else (e.g. a firewall rule) will be required to forward the traffic from port 443 to the ip:port combination specified in `listen_addr`.
 
+#### DNS-01 with TencentCloud DNSPod
+
+The `tencentcloud` provider uses [libdns/tencentcloud](https://github.com/libdns/tencentcloud)
+to publish challenges directly to DNSPod. It requires Tencent Cloud API credentials,
+not a legacy DNSPod `ID,token`. Configure the provider once for both node certificates
+(`tailscale cert` / HTTPS Serve) and Headscale's own DNS-01 certificate:
+
+```yaml
+dns:
+  magic_dns: true
+  base_domain: example.com
+  certificates:
+    enabled: true
+    zone: example.com
+  challenge:
+    propagation_timeout: 2m
+    resolvers: ["1.1.1.1:53", "8.8.8.8:53"]
+    provider:
+      name: tencentcloud
+      secret_id_path: /run/credentials/headscale.service/tencent-secret-id
+      secret_key_path: /run/credentials/headscale.service/tencent-secret-key
+      min_ttl: 600
+```
+
+`secret_id` and `secret_key` are required. Optional `session_token` supports temporary
+credentials; optional `region` selects the provider's regional API endpoint. These
+string fields support the same `_path` suffix as other DNS providers. Environment
+settings use the `HEADSCALE_DNS_CHALLENGE_PROVIDER_` prefix, for example
+`HEADSCALE_DNS_CHALLENGE_PROVIDER_SECRET_KEY_PATH`.
+
+`min_ttl` is the minimum TXT TTL in seconds, defaulting to 600 for DNSPod's free
+plan. Set it to 60 only when the domain's plan permits that TTL. Same-name
+challenges (including wildcard orders) may wait for a previous record set's actual
+TTL to expire before validation starts; with the free plan this can take ten minutes.
+
+The credential needs DNSPod `DescribeRecordList`, `CreateRecord` and `DeleteRecord`
+permissions for the configured zone. Keep credential files readable only by the
+Headscale process. Public DNS-01 validation does not require exposing the node's
+HTTP/HTTPS port. Explicit challenge resolvers avoid a local MagicDNS zone hiding
+the public zone's authoritative nameservers.
+
 ### Technical description
 
 Headscale uses [CertMagic](https://github.com/caddyserver/certmagic), a Golang library providing [ACME protocol](https://en.wikipedia.org/wiki/Automatic_Certificate_Management_Environment) verification, to facilitate certificate renewals via [Let's Encrypt](https://letsencrypt.org/about/). Certificates will be renewed automatically, and the following can be expected:
