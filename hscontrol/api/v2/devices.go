@@ -1,10 +1,12 @@
 package apiv2
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"net/netip"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -19,31 +21,73 @@ func init() {
 }
 
 // Device is the Tailscale device response. Headscale nodes map onto it; fields
-// Headscale does not track are emitted as their zero value. The route slices
-// are only populated for the fields=all variant, matching Tailscale.
+// Headscale does not track are left out, apart from UpdateAvailable. The route
+// slices and the host detail are only populated for the fields=all variant,
+// matching Tailscale.
 type Device struct {
-	Addresses         []string   `json:"addresses"          nullable:"false"`
+	Addresses         []string   `json:"addresses"         nullable:"false"`
 	Name              string     `json:"name"`
 	ID                string     `json:"id"`
 	NodeID            string     `json:"nodeId"`
 	Authorized        bool       `json:"authorized"`
 	User              string     `json:"user"`
-	Tags              []string   `json:"tags"               nullable:"false"`
+	Tags              []string   `json:"tags"              nullable:"false"`
 	KeyExpiryDisabled bool       `json:"keyExpiryDisabled"`
 	Created           time.Time  `json:"created"`
 	Expires           *time.Time `json:"expires,omitempty"`
 	Hostname          string     `json:"hostname"`
 	IsEphemeral       bool       `json:"isEphemeral"`
-	LastSeen          *time.Time `json:"lastSeen,omitempty"`
-	MachineKey        string     `json:"machineKey"`
-	NodeKey           string     `json:"nodeKey"`
-	OS                string     `json:"os"`
-	ClientVersion     string     `json:"clientVersion"`
-	UpdateAvailable   bool       `json:"updateAvailable"`
+	// ConnectedToControl and LastSeen follow what Tailscale sends, not its SDK's
+	// comment: every connected device has both.
+	ConnectedToControl bool       `json:"connectedToControl"`
+	LastSeen           *time.Time `json:"lastSeen,omitempty"`
+	MachineKey         string     `json:"machineKey"`
+	NodeKey            string     `json:"nodeKey"`
+	OS                 string     `json:"os"`
+	ClientVersion      string     `json:"clientVersion"`
+	UpdateAvailable    bool       `json:"updateAvailable"`
 
-	// Populated only when fields=all is requested.
-	AdvertisedRoutes []string `json:"advertisedRoutes,omitempty"`
-	EnabledRoutes    []string `json:"enabledRoutes,omitempty"`
+	BlocksIncomingConnections bool `json:"blocksIncomingConnections"`
+
+	// OAuthClientID names the auth key the device joined with. For a key a
+	// token made, Tailscale names the token's OAuth client, which headscale
+	// does not record, so it is left out.
+	OAuthClientID string `json:"oauthClientId,omitempty"`
+
+	// Populated only when fields=all is requested, then as [] when empty.
+	AdvertisedRoutes []string `json:"advertisedRoutes,omitzero"`
+	EnabledRoutes    []string `json:"enabledRoutes,omitzero"`
+
+	SSHEnabled         *bool               `json:"sshEnabled,omitempty"`
+	Distro             *Distro             `json:"distro,omitempty"`
+	ClientConnectivity *ClientConnectivity `json:"clientConnectivity,omitempty"`
+}
+
+// Distro is the Linux distribution a device reports.
+type Distro struct {
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	CodeName string `json:"codeName"`
+}
+
+// ClientConnectivity is how a device reaches the network, from what it reports.
+// Latency stays empty: headscale drops a client's DERP latency on arrival.
+type ClientConnectivity struct {
+	Endpoints             []string       `json:"endpoints"             nullable:"false"`
+	MappingVariesByDestIP bool           `json:"mappingVariesByDestIP"`
+	Latency               map[string]any `json:"latency"               nullable:"false"`
+	ClientSupports        ClientSupports `json:"clientSupports"`
+}
+
+// ClientSupports is what a device's network allows. HairPinning stays null:
+// clients no longer report it.
+type ClientSupports struct {
+	HairPinning *bool `json:"hairPinning"`
+	IPv6        bool  `json:"ipv6"`
+	PCP         bool  `json:"pcp"`
+	PMP         bool  `json:"pmp"`
+	UDP         bool  `json:"udp"`
+	UPnP        bool  `json:"upnp"`
 }
 
 // DeviceRoutes is the GET /device/{id}/routes response: what the node announces
@@ -53,24 +97,35 @@ type DeviceRoutes struct {
 	Enabled    []string `json:"enabledRoutes"    nullable:"false"`
 }
 
-// Request bodies match the Tailscale SDK wire shapes.
+// Request bodies match the Tailscale SDK wire shapes and, like Tailscale's,
+// ignore properties they do not define.
 type (
 	setAuthorizedRequest struct {
+		_ struct{} `additionalProperties:"true"`
+
 		Authorized bool `json:"authorized"`
 	}
 	setNameRequest struct {
+		_ struct{} `additionalProperties:"true"`
+
 		Name string `json:"name"`
 	}
 	// setTagsRequest.Tags is intentionally not nullable:"false": the SDK sends
 	// "tags":null for "make untagged", which the handler accepts as a no-op
 	// rather than failing to decode (Headscale cannot untag a node).
 	setTagsRequest struct {
+		_ struct{} `additionalProperties:"true"`
+
 		Tags []string `json:"tags"`
 	}
 	setKeyRequest struct {
+		_ struct{} `additionalProperties:"true"`
+
 		KeyExpiryDisabled bool `json:"keyExpiryDisabled"`
 	}
 	setSubnetRoutesRequest struct {
+		_ struct{} `additionalProperties:"true"`
+
 		Routes []string `json:"routes" nullable:"false"`
 	}
 )
@@ -132,7 +187,7 @@ func registerDevices(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		return &deviceOutput{Body: deviceFromView(node, in.Fields == "all")}, nil
+		return &deviceOutput{Body: deviceFromView(node, in.Fields == "all", b.Cfg.BaseDomain)}, nil
 	})
 
 	huma.Register(api, requireScope(huma.Operation{
@@ -156,8 +211,13 @@ func registerDevices(api huma.API, b Backend) {
 		out.Body.Devices = make([]Device, 0, nodes.Len())
 
 		for _, node := range nodes.All() {
-			out.Body.Devices = append(out.Body.Devices, deviceFromView(node, allFields))
+			out.Body.Devices = append(out.Body.Devices, deviceFromView(node, allFields, b.Cfg.BaseDomain))
 		}
+
+		// The NodeStore holds no order, and Tailscale lists devices by name.
+		slices.SortFunc(out.Body.Devices, func(a, b Device) int {
+			return cmp.Compare(a.Name, b.Name)
+		})
 
 		return out, nil
 	})
@@ -195,6 +255,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:          deviceTags,
 		Security:      security,
 		DefaultStatus: http.StatusOK,
+		MaxBodyBytes:  maxBodyBytes,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
 	}, scope.DevicesCore), func(ctx context.Context, in *setAuthorizedInput) (*emptyOutput, error) {
 		_, err := lookupNode(b, in.DeviceID)
@@ -222,6 +283,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:          deviceTags,
 		Security:      security,
 		DefaultStatus: http.StatusOK,
+		MaxBodyBytes:  maxBodyBytes,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
 	}, scope.DevicesCore), func(ctx context.Context, in *setNameInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
@@ -247,6 +309,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:          deviceTags,
 		Security:      security,
 		DefaultStatus: http.StatusOK,
+		MaxBodyBytes:  maxBodyBytes,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
 	}, scope.DevicesCore), func(ctx context.Context, in *setTagsInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
@@ -266,12 +329,17 @@ func registerDevices(api huma.API, b Backend) {
 		// owned by a held tag per policy); an admin API key is unrestricted. The
 		// devices:core scope alone must not let a token stamp an arbitrary policy
 		// tag (e.g. tag:prod) onto any node. SetNodeTags still enforces that each
-		// tag exists in policy.
+		// tag exists in policy. SetNodeTags replaces the set, so the token must
+		// also own every tag the device holds; as on Tailscale SaaS, the refusal
+		// then names them all.
 		if tokenTags, isOAuth := principalTags(ctx); isOAuth {
-			for _, tag := range in.Body.Tags {
-				if !b.State.TagOwnedByTags(tag, tokenTags) {
-					return nil, huma.Error403Forbidden("token may not assign tag " + tag)
-				}
+			current := node.Tags().AsSlice()
+			if len(unownedTags(b, current, tokenTags)) > 0 {
+				return nil, tagsRefused("cannot remove current tags: ", current)
+			}
+
+			if refused := unownedTags(b, in.Body.Tags, tokenTags); len(refused) > 0 {
+				return nil, tagsRefused("", refused)
 			}
 		}
 
@@ -286,6 +354,33 @@ func registerDevices(api huma.API, b Backend) {
 	})
 
 	huma.Register(api, requireScope(huma.Operation{
+		OperationID:   "expireDevice",
+		Method:        http.MethodPost,
+		Path:          "/api/v2/device/{id}/expire",
+		Summary:       "Expire a device's key",
+		Tags:          deviceTags,
+		Security:      security,
+		DefaultStatus: http.StatusOK,
+		Errors:        []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
+	}, scope.DevicesCore), func(ctx context.Context, in *deviceByIDInput) (*emptyOutput, error) {
+		node, err := lookupNode(b, in.DeviceID)
+		if err != nil {
+			return nil, err
+		}
+
+		now := time.Now()
+
+		_, nodeChange, err := b.State.SetNodeExpiry(node.ID(), &now)
+		b.Change(nodeChange)
+
+		if err != nil {
+			return nil, mapError("expiring device", err)
+		}
+
+		return &emptyOutput{}, nil
+	})
+
+	huma.Register(api, requireScope(huma.Operation{
 		OperationID:   "setDeviceKey",
 		Method:        http.MethodPost,
 		Path:          "/api/v2/device/{id}/key",
@@ -293,6 +388,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:          deviceTags,
 		Security:      security,
 		DefaultStatus: http.StatusOK,
+		MaxBodyBytes:  maxBodyBytes,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
 	}, scope.DevicesCore), func(ctx context.Context, in *setKeyInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
@@ -326,6 +422,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:          deviceTags,
 		Security:      security,
 		DefaultStatus: http.StatusOK,
+		MaxBodyBytes:  maxBodyBytes,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
 	}, scope.DevicesRoutes), func(ctx context.Context, in *setSubnetRoutesInput) (*deviceRoutesOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
@@ -376,7 +473,7 @@ func lookupNode(b Backend, rawID string) (types.NodeView, error) {
 
 	node, ok := b.State.GetNodeByID(nodeID)
 	if !ok {
-		return types.NodeView{}, huma.Error404NotFound("device not found")
+		return types.NodeView{}, huma.Error404NotFound("no manageable device matching this ID found")
 	}
 
 	return node, nil
@@ -391,6 +488,11 @@ func parseRoutes(routes []string) ([]netip.Prefix, error) {
 		prefix, err := netip.ParsePrefix(route)
 		if err != nil {
 			return nil, huma.Error400BadRequest("parsing route", err)
+		}
+
+		err = util.CheckRouteMasked(prefix)
+		if err != nil {
+			return nil, huma.Error400BadRequest(prefix.String() + " " + err.Error())
 		}
 
 		if prefix == tsaddr.AllIPv4() || prefix == tsaddr.AllIPv6() {
@@ -408,25 +510,36 @@ func parseRoutes(routes []string) ([]netip.Prefix, error) {
 // deviceFromView maps a Headscale node onto the Tailscale Device, reading
 // through the [types.NodeView] accessors. allFields gates the route slices,
 // which Tailscale only returns for fields=all.
-func deviceFromView(view types.NodeView, allFields bool) Device {
+func deviceFromView(view types.NodeView, allFields bool, baseDomain string) Device {
 	id := view.StringID()
 
+	// Tailscale names a device by its MagicDNS FQDN, without the root dot.
+	name := view.GivenName()
+	if baseDomain != "" {
+		name += "." + baseDomain
+	}
+
 	d := Device{
-		Addresses:         emptyIfNil(view.IPsAsString()),
-		Name:              view.GivenName(),
-		ID:                id,
-		NodeID:            id,
-		Authorized:        true, // Headscale has no post-registration de-auth state.
-		User:              deviceUser(view),
-		Tags:              emptyIfNil(view.Tags().AsSlice()),
-		KeyExpiryDisabled: !view.Expiry().Valid(),
-		Created:           view.CreatedAt(),
-		Hostname:          view.Hostname(),
-		IsEphemeral:       view.IsEphemeral(),
-		MachineKey:        view.MachineKey().String(),
-		NodeKey:           view.NodeKey().String(),
-		OS:                hostinfoOS(view),
-		ClientVersion:     hostinfoVersion(view),
+		Addresses:          emptyIfNil(view.IPsAsString()),
+		Name:               name,
+		ID:                 id,
+		NodeID:             id,
+		Authorized:         true, // Headscale has no post-registration de-auth state.
+		User:               deviceUser(view),
+		Tags:               emptyIfNil(view.Tags().AsSlice()),
+		KeyExpiryDisabled:  !view.Expiry().Valid(),
+		Created:            view.CreatedAt(),
+		Hostname:           view.Hostname(),
+		IsEphemeral:        view.IsEphemeral(),
+		ConnectedToControl: view.IsOnline().Valid() && view.IsOnline().Get(),
+		MachineKey:         view.MachineKey().String(),
+		NodeKey:            view.NodeKey().String(),
+		OS:                 hostinfoOS(view),
+		ClientVersion:      hostinfoVersion(view),
+	}
+
+	if key := view.AuthKey(); key.Valid() && !key.CreatedByToken() {
+		d.OAuthClientID = strconv.FormatUint(key.ID(), util.Base10)
 	}
 
 	if view.Expiry().Valid() {
@@ -434,15 +547,50 @@ func deviceFromView(view types.NodeView, allFields bool) Device {
 		d.Expires = &exp
 	}
 
-	// LastSeen is reported only when the device is offline, matching tailcfg.
-	if view.LastSeen().Valid() && view.IsOnline().Valid() && !view.IsOnline().Get() {
+	// The stored time does not move while a client idles. A connected device
+	// reads now, so a "not seen for a while" script cannot pick a live device.
+	switch {
+	case d.ConnectedToControl:
+		now := time.Now().UTC()
+		d.LastSeen = &now
+	case view.LastSeen().Valid():
 		ls := view.LastSeen().Get()
 		d.LastSeen = &ls
 	}
 
+	hi := view.Hostinfo()
+	d.BlocksIncomingConnections = hi.Valid() && hi.ShieldsUp()
+
 	if allFields {
 		d.AdvertisedRoutes = emptyIfNil(util.PrefixesToString(view.AnnouncedRoutes()))
 		d.EnabledRoutes = emptyIfNil(util.PrefixesToString(view.ApprovedRoutes().AsSlice()))
+
+		sshEnabled := hi.Valid() && hi.TailscaleSSHEnabled()
+		d.SSHEnabled = &sshEnabled
+		d.Distro = &Distro{}
+		d.ClientConnectivity = &ClientConnectivity{
+			Endpoints: make([]string, 0, view.Endpoints().Len()),
+			Latency:   map[string]any{},
+		}
+
+		for _, ep := range view.Endpoints().All() {
+			d.ClientConnectivity.Endpoints = append(d.ClientConnectivity.Endpoints, ep.String())
+		}
+
+		if hi.Valid() {
+			d.Distro = &Distro{Name: hi.Distro(), Version: hi.DistroVersion(), CodeName: hi.DistroCodeName()}
+
+			if ni := hi.NetInfo(); ni.Valid() {
+				d.ClientConnectivity.MappingVariesByDestIP = ni.MappingVariesByDestIP().EqualBool(true)
+				d.ClientConnectivity.ClientSupports = ClientSupports{
+					IPv6: ni.WorkingIPv6().EqualBool(true),
+					PCP:  ni.PCP().EqualBool(true),
+					PMP:  ni.PMP().EqualBool(true),
+					UDP:  ni.WorkingUDP().EqualBool(true),
+					UPnP: ni.UPnP().EqualBool(true),
+				}
+			}
+		}
 	}
 
 	return d
@@ -455,10 +603,18 @@ func routesFromView(view types.NodeView) DeviceRoutes {
 	}
 }
 
-// deviceUser is the owning login. [types.NodeView.Owner] already resolves the
-// tags-as-identity rule: tagged nodes present the special TaggedDevices user,
-// user-owned nodes present their login, orphaned nodes present nothing.
+// deviceUser is the owning login. A tagged device, owned by its tags, shows
+// the login that made the key it joined with, as Tailscale does: nothing when
+// a token made that key.
 func deviceUser(view types.NodeView) string {
+	if view.IsTagged() {
+		if key := view.AuthKey(); key.Valid() && key.User().Valid() {
+			return key.User().Username()
+		}
+
+		return ""
+	}
+
 	owner := view.Owner()
 	if owner.Valid() {
 		return owner.Username()

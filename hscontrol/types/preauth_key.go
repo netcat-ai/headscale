@@ -65,6 +65,9 @@ type PreAuthKey struct {
 	// If non-empty, this creates tagged nodes (not user-owned).
 	Tags []string `gorm:"serializer:json"`
 
+	// CreatedByToken is set when an OAuth access token made the key.
+	CreatedByToken bool
+
 	CreatedAt  *time.Time
 	Expiration *time.Time
 
@@ -155,6 +158,29 @@ func (pak *PreAuthKey) ConvertsNodeToTagged(node NodeView) bool {
 func (pak *PreAuthKey) RetagsNode(node NodeView) bool {
 	return node.IsTagged() && pak.IsTagged() &&
 		(!node.AuthKeyID().Valid() || node.AuthKeyID().Get() != pak.ID)
+}
+
+// CanReauthenticate reports whether this key speaks for node: a tagged key
+// (it brings its own tags), a key of the node's user, or a key of the user a
+// tagged node can be claimed by (see [NodeView.ClaimableBy]).
+func (pak *PreAuthKey) CanReauthenticate(node NodeView) bool {
+	if pak == nil || !node.Valid() {
+		return false
+	}
+
+	if pak.IsTagged() {
+		return true
+	}
+
+	if pak.User == nil {
+		return false
+	}
+
+	if node.IsTagged() {
+		return node.ClaimableBy(UserID(pak.User.ID))
+	}
+
+	return node.UserID().Valid() && node.UserID().Get() == pak.User.ID
 }
 
 // maskedPrefix returns the key prefix in masked format for safe logging.

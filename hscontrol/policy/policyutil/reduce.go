@@ -13,11 +13,19 @@ import (
 // ReduceFilterRules takes a node and a set of global filter rules and removes all rules
 // and destinations that are not relevant to that particular node.
 //
+// nodeAddrs holds every node's addresses. A destination prefix made only of
+// them merges several nodes' addresses, and the node keeps just its own, as
+// Tailscale lists them; any other prefix stays whole. nil keeps all whole.
+//
 // IMPORTANT: This function is designed for global filters only. Per-node filters
 // (from autogroup:self policies) are already node-specific and should not be passed
 // to this function. Use [policy.PolicyManager.FilterForNode] instead, which handles
 // both cases.
-func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+func ReduceFilterRules(
+	node types.NodeView,
+	rules []tailcfg.FilterRule,
+	nodeAddrs *netipx.IPSet,
+) []tailcfg.FilterRule {
 	ret := []tailcfg.FilterRule{}
 	nodeIPs := node.IPs()
 	subnetRoutes := node.SubnetRoutes()
@@ -40,7 +48,7 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 
 		for _, dest := range rule.DstPorts {
 			if destReachesNode(dest.IP, nodeIPs, subnetRoutes, exitRoutes) {
-				dests = append(dests, dest)
+				dests = appendOwnDests(dests, dest, nodeIPs, subnetRoutes, exitRoutes, nodeAddrs)
 			}
 		}
 
@@ -83,11 +91,49 @@ func destReachesNode(dst string, nodeIPs []netip.Addr, subnetRoutes, exitRoutes 
 		slices.ContainsFunc(exitRoutes, overlaps)
 }
 
+// appendOwnDests appends dest, which reaches the node, to dests. A prefix
+// made only of node addresses, which no route of the node overlaps, becomes
+// one entry per node address inside it; anything else stays whole.
+func appendOwnDests(
+	dests []tailcfg.NetPortRange,
+	dest tailcfg.NetPortRange,
+	nodeIPs []netip.Addr,
+	subnetRoutes, exitRoutes []netip.Prefix,
+	nodeAddrs *netipx.IPSet,
+) []tailcfg.NetPortRange {
+	pfx, err := netip.ParsePrefix(dest.IP)
+	if err != nil || !destinationNeedsOwnAddressExpansion(pfx, subnetRoutes, exitRoutes, nodeAddrs) {
+		return append(dests, dest)
+	}
+
+	for _, ip := range nodeIPs {
+		if pfx.Contains(ip) {
+			own := dest
+			own.IP = ip.String()
+			dests = append(dests, own)
+		}
+	}
+
+	return dests
+}
+
+func destinationNeedsOwnAddressExpansion(
+	pfx netip.Prefix,
+	subnetRoutes, exitRoutes []netip.Prefix,
+	nodeAddrs *netipx.IPSet,
+) bool {
+	return !pfx.IsSingleIP() && nodeAddrs != nil && nodeAddrs.ContainsPrefix(pfx) &&
+		!slices.ContainsFunc(subnetRoutes, pfx.Overlaps) &&
+		!slices.ContainsFunc(exitRoutes, pfx.Overlaps)
+}
+
 // reduceCapGrantRule filters a [tailcfg.CapGrant] rule to only include
 // [tailcfg.CapGrant] entries whose Dsts match the given node's IPs. When a
 // broad prefix (e.g. 100.64.0.0/10 from dst:*) contains a node's IP, it is
 // narrowed to the node's specific /32 or /128 prefix. Returns nil if
-// no [tailcfg.CapGrant] entries are relevant to this node.
+// no [tailcfg.CapGrant] entries are relevant to this node. A destination the
+// node only routes is not relevant: via-grant-v84 and v86 show SaaS sending a
+// router no capability for its subnet.
 func reduceCapGrantRule(
 	node types.NodeView,
 	rule tailcfg.FilterRule,
@@ -95,7 +141,6 @@ func reduceCapGrantRule(
 	var capGrants []tailcfg.CapGrant
 
 	nodeIPs := node.IPs()
-	subnetRoutes := node.SubnetRoutes()
 
 	for _, cg := range rule.CapGrant {
 		// Collect the node's IPs that fall within any of this
@@ -120,27 +165,9 @@ func reduceCapGrantRule(
 			}
 		}
 
-		// Asymmetric on purpose: the IP-match loop above narrows broad
-		// prefixes to node-specific /32 or /128 so peers receive only
-		// the minimum routing surface. The route-match loop below
-		// preserves the original prefix so the subnet-serving node
-		// receives the full CapGrant scope. [types.NodeView.SubnetRoutes]
-		// excludes both unapproved and exit routes, matching Tailscale
-		// SaaS behavior.
-		for _, dst := range cg.Dsts {
-			for _, subnetRoute := range subnetRoutes {
-				if dst.Overlaps(subnetRoute) {
-					// For route overlaps, keep the original prefix.
-					matchingDsts = append(matchingDsts, dst)
-				}
-			}
-		}
-
 		if len(matchingDsts) > 0 {
-			// A Dst can be appended twice when a broad prefix both
-			// contains a node IP and overlaps one of its approved
-			// subnet routes. Sort + Compact dedups; [netip.Prefix] is
-			// comparable so Compact works with ==.
+			// Several Dsts can narrow to the same node IP. Sort + Compact
+			// dedups; [netip.Prefix] is comparable so Compact works with ==.
 			slices.SortFunc(matchingDsts, netip.Prefix.Compare)
 			matchingDsts = slices.Compact(matchingDsts)
 

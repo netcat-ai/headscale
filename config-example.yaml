@@ -115,7 +115,8 @@ derp:
     - https://controlplane.tailscale.com/derpmap/default
 
   # Locally available DERP map files. The extension picks the format: .yaml/.yml,
-  # or Tailscale JSON as .json or .hujson.
+  # or Tailscale JSON as .json or .hujson. Both JSON extensions accept comments
+  # and trailing commas.
   #
   # This option is mostly interesting for people hosting their own DERP servers:
   # https://tailscale.com/docs/reference/derp-servers/custom-derp-servers
@@ -187,9 +188,6 @@ database:
 
   # GORM configuration settings.
   gorm:
-    # Enable prepared statements.
-    prepare_stmt: true
-
     # Enable parameterized queries.
     parameterized_queries: true
 
@@ -354,7 +352,8 @@ dns:
   #   - { name: "prometheus.myvpn.example.com", type: "A", value: "100.64.0.3" }
   #
   # Alternatively, extra DNS records can be loaded from a file. The extension
-  # picks the format: .json, .hujson, .yaml or .yml.
+  # picks the format: .json, .hujson, .yaml or .yml. Both JSON extensions
+  # accept comments and trailing commas.
   # Headscale processes this file on each change.
   # extra_records_path: /var/lib/headscale/extra-records.json
 
@@ -518,7 +517,10 @@ auto_update:
 #
 # tuning:
 #   # Maximum number of pending registration entries in the auth cache.
-#   # Oldest entries are evicted when the cap is reached.
+#   # At capacity, new registrations retry without displacing pending approvals.
+#   # SSH checks can use 64 additional reserved entries. Each registration
+#   # retains at most 64 KiB of serialized data, so the default registration
+#   # payload budget is 64 MiB plus record overhead.
 #   #
 #   # register_cache_max_entries: 1024
 #

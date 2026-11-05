@@ -2,12 +2,69 @@ package state
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/dnsname"
 )
+
+func TestNewNodeStoreBumpsDuplicateNames(t *testing.T) {
+	nodes := types.Nodes{
+		{ID: 4, GivenName: "DB"},
+		{ID: 2, GivenName: "db"},
+		{ID: 1, GivenName: "db"},
+		{ID: 3, GivenName: "db-1"},
+		{ID: 5, GivenName: ""},
+		{ID: 6, GivenName: ""},
+	}
+	want := map[types.NodeID]string{
+		1: "db", 2: "db-2", 3: "db-1", 4: "DB-3", 5: "", 6: "",
+	}
+
+	for range 2 {
+		store := NewNodeStore(nodes, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+		for id, name := range want {
+			node, ok := store.GetNode(id)
+			require.True(t, ok)
+			assert.Equal(t, name, node.GivenName())
+		}
+	}
+
+	assert.Equal(t, "db", nodes[1].GivenName, "loading must not mutate the input rows")
+}
+
+func TestPutNodeBumpsPastReservedLabel(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
+		{Name: "laptop." + cfg.BaseDomain},
+		{Name: "laptop-1." + cfg.BaseDomain},
+	}}
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node := s.nodeStore.PutNode(createTestNode(1, 1, "alice", "laptop"))
+	require.Equal(t, "laptop-2", node.GivenName())
+}
+
+func TestSetGivenNameRejectsReservedLabel(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
+		{Name: "laptop." + cfg.BaseDomain},
+	}}
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	s.nodeStore.PutNode(createTestNode(1, 1, "alice", "phone"))
+	_, err = s.nodeStore.SetGivenName(1, "laptop")
+	require.ErrorIs(t, err, ErrGivenNameTaken)
+}
 
 // TestPutNodeGivenNameCollisionBumps is the reproduction for #3188.
 // Before the hostname-cleanroom rewrite, two nodes could be written
@@ -31,6 +88,27 @@ func TestPutNodeGivenNameCollisionBumps(t *testing.T) {
 	require.Equal(t, "laptop", got1.GivenName(), "first registration keeps base label")
 	require.Equal(t, "laptop-1", got2.GivenName(), "second registration bumps to -1")
 	require.Equal(t, "laptop-2", got3.GivenName(), "third registration bumps to -2")
+}
+
+func TestPutNodeBumpCutsLabelToFitSuffix(t *testing.T) {
+	store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+	store.Start()
+	defer store.Stop()
+
+	long := strings.Repeat("a", 63)
+
+	got := make([]string, 0, 12)
+	for id := range types.NodeID(12) {
+		got = append(got, store.PutNode(createTestNode(id+1, 1, "alice", long)).GivenName())
+	}
+
+	require.Equal(t, long, got[0])
+	require.Equal(t, long[:61]+"-1", got[1])
+	require.Equal(t, long[:60]+"-10", got[10])
+	require.Equal(t, long[:60]+"-11", got[11])
+	require.True(t, isAutoDerivedGivenName(got[10], long),
+		"a cut label still follows its hostname")
 }
 
 // TestPutNodeEmptyGivenNameFallsBackToNode covers the SaaS rule that
@@ -231,4 +309,66 @@ func TestSetGivenNameIdempotent(t *testing.T) {
 	view, err := store.SetGivenName(1, "laptop")
 	require.NoError(t, err)
 	require.Equal(t, "laptop", view.GivenName())
+}
+
+func TestPutNodeGivenNameBumpFitsDNSLabel(t *testing.T) {
+	maxLabel := strings.Repeat("a", util.LabelHostnameLength)
+
+	tests := []struct {
+		name     string
+		hostname string
+		holders  int
+		want     string
+	}{
+		{name: "short base keeps full base", hostname: "laptop", holders: 1, want: "laptop-1"},
+		{name: "max length base trimmed for one digit suffix", hostname: maxLabel, holders: 1, want: strings.Repeat("a", 61) + "-1"},
+		{name: "max length base trimmed for two digit suffix", hostname: maxLabel, holders: 10, want: strings.Repeat("a", 60) + "-10"},
+		{name: "hyphen left at cut point is stripped", hostname: strings.Repeat("a", 60) + "-bb", holders: 1, want: strings.Repeat("a", 60) + "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewNodeStore(nil, allowAllPeersFunc, TestBatchSize, TestBatchTimeout)
+
+			store.Start()
+			defer store.Stop()
+
+			for id := range tt.holders {
+				store.PutNode(createTestNode(types.NodeID(id+1), 1, "alice", tt.hostname)) //nolint:gosec // test ids
+			}
+
+			got := store.PutNode(createTestNode(types.NodeID(tt.holders+1), 1, "alice", tt.hostname)).GivenName() //nolint:gosec // test ids
+
+			require.Equal(t, tt.want, got)
+			require.NoError(t, dnsname.ValidLabel(got))
+		})
+	}
+}
+
+func TestIsAutoDerivedGivenName(t *testing.T) {
+	maxLabel := strings.Repeat("a", util.LabelHostnameLength)
+
+	tests := []struct {
+		name     string
+		given    string
+		hostname string
+		want     bool
+	}{
+		{name: "sanitised hostname", given: "laptop", hostname: "laptop", want: true},
+		{name: "short bump", given: "laptop-1", hostname: "laptop", want: true},
+		{name: "signed suffix is not a generated name", given: "laptop-+1", hostname: "laptop", want: false},
+		{name: "trimmed max length bump", given: strings.Repeat("a", 61) + "-1", hostname: maxLabel, want: true},
+		{name: "hyphen trimmed at cut point", given: strings.Repeat("a", 60) + "-1", hostname: strings.Repeat("a", 60) + "-bb", want: true},
+		{name: "legacy hyphen kept at cut point", given: strings.Repeat("a", 60) + "--1", hostname: strings.Repeat("a", 60) + "-bb", want: true},
+		{name: "zero padded suffix is not a generated name", given: "laptop-01", hostname: "laptop", want: false},
+		{name: "admin name with repeated hyphen", given: "laptop--1", hostname: "laptop", want: false},
+		{name: "trimmed prefix with mismatched suffix length", given: strings.Repeat("a", 61) + "-10", hostname: maxLabel, want: false},
+		{name: "admin rename", given: "workstation", hostname: "laptop", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, isAutoDerivedGivenName(tt.given, tt.hostname))
+		})
+	}
 }

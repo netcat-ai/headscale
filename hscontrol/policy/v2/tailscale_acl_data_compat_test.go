@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/netip"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -27,7 +28,10 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
+	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 )
 
@@ -201,6 +205,94 @@ func loadACLTestFile(t *testing.T, path string) *testcapture.Capture {
 	return c
 }
 
+// aclSkipReasons lists checks where headscale differs from SaaS, keyed
+// <test_id>[/<node>]/<check>.
+var aclSkipReasons = map[string]string{
+	"acl-au06/beedrill/filter":   srcAddressForm,
+	"acl-k03/beedrill/filter":    srcAddressForm,
+	"acl-k03/bulbasaur/filter":   srcAddressForm,
+	"acl-k03/charmander/filter":  srcAddressForm,
+	"acl-k03/ivysaur/filter":     srcAddressForm,
+	"acl-k03/kakuna/filter":      srcAddressForm,
+	"acl-k03/squirtle/filter":    srcAddressForm,
+	"acl-k03/venusaur/filter":    srcAddressForm,
+	"acl-k03/weedle/filter":      srcAddressForm,
+	"acl-mr09/beedrill/filter":   srcAddressForm,
+	"acl-mr20/beedrill/filter":   srcAddressForm,
+	"acl-mu07/beedrill/filter":   srcAddressForm,
+	"acl-mu07/bulbasaur/filter":  srcAddressForm,
+	"acl-mu07/charmander/filter": srcAddressForm,
+	"acl-mu07/ivysaur/filter":    srcAddressForm,
+	"acl-mu07/kakuna/filter":     srcAddressForm,
+	"acl-mu07/squirtle/filter":   srcAddressForm,
+	"acl-mu07/venusaur/filter":   srcAddressForm,
+	"acl-mu07/weedle/filter":     srcAddressForm,
+
+	"acl-self-plus-dsts/kakuna/filter":    srcAddressForm,
+	"acl-self-plus-dsts/beedrill/filter":  srcAddressForm,
+	"acl-self-plus-dsts/bulbasaur/filter": srcAndSelfDstForm,
+
+	"routes-exit-family-ipv4/refused": aclDefaultRouteAccepted,
+	"routes-exit-family-ipv6/refused": aclDefaultRouteAccepted,
+}
+
+const (
+	srcAddressForm          = "FILTER_ADDRESS_FORM: SaaS lists contiguous source addresses one by one, headscale as a range"
+	srcAndSelfDstForm       = "FILTER_ADDRESS_FORM+SELF_DST_REPEAT: sources listed one by one, the autogroup:self destination written once per source alias"
+	aclDefaultRouteAccepted = "ACL_DEFAULT_ROUTE_ACCEPTED: headscale accepts literal 0.0.0.0/0 and ::/0 ACL destinations; SaaS rejects them and requires * or autogroup:internet"
+)
+
+// sourcesAsRanges rewrites each rule's sources as the ranges they cover, so
+// that one list of addresses and one range of them compare equal.
+func sourcesAsRanges(t *testing.T, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	t.Helper()
+
+	out := make([]tailcfg.FilterRule, len(rules))
+
+	for i, rule := range rules {
+		var builder netipx.IPSetBuilder
+
+		for _, src := range rule.SrcIPs {
+			set, err := util.ParseIPSet(src, nil)
+			require.NoError(t, err)
+
+			builder.AddSet(set)
+		}
+
+		set, err := builder.IPSet()
+		require.NoError(t, err)
+
+		rule.SrcIPs = nil
+		for _, r := range set.Ranges() {
+			rule.SrcIPs = append(rule.SrcIPs, r.String())
+		}
+
+		out[i] = rule
+	}
+
+	return out
+}
+
+// withoutRepeatedDsts drops each rule's repeated destinations, keeping the
+// first of each.
+func withoutRepeatedDsts(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	out := make([]tailcfg.FilterRule, len(rules))
+
+	for i, rule := range rules {
+		seen := map[string]bool{}
+		rule.DstPorts = slices.DeleteFunc(slices.Clone(rule.DstPorts), func(dst tailcfg.NetPortRange) bool {
+			key := dst.IP + ":" + dst.Ports.String()
+			repeat := seen[key]
+			seen[key] = true
+
+			return repeat
+		})
+		out[i] = rule
+	}
+
+	return out
+}
+
 // TestACLCompat is a data-driven test that loads all ACL-*.json test files
 // and compares headscale's ACL engine output against the expected behavior.
 //
@@ -230,7 +322,7 @@ func TestACLCompat(t *testing.T) {
 			t.Parallel()
 
 			if tf.Error {
-				testACLError(t, tf)
+				testCompatRefusal(t, aclSkipReasons, tf)
 
 				return
 			}
@@ -247,71 +339,48 @@ func TestACLCompat(t *testing.T) {
 	}
 }
 
-// testACLError verifies that an invalid policy produces the expected error.
-func testACLError(t *testing.T, tf *testcapture.Capture) {
+// testCompatRefusal checks that headscale refuses a policy SaaS refused, with
+// SaaS's message in its error; checks are keyed <test_id>/<check> in skips.
+func testCompatRefusal(t *testing.T, skips map[string]string, tf *testcapture.Capture) {
 	t.Helper()
 
 	policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
 
 	pol, err := unmarshalPolicy(policyJSON)
-	if err != nil {
-		// Parse-time error.
-		if tf.Input.APIResponseBody != nil {
-			wantMsg := tf.Input.APIResponseBody.Message
-			if wantMsg != "" {
-				assertACLErrorContains(
-					t, err, wantMsg, tf.TestID,
-				)
-			}
+	if err == nil {
+		err = pol.validate()
+	}
+
+	key := tf.TestID + "/"
+
+	compatCheck(t, skips, key+"refused", func() string {
+		if err == nil {
+			return "SaaS refused; the policy parsed and validated"
 		}
 
+		return ""
+	})
+
+	if err == nil {
+		compatChecksNotRun(t, skips, key+"message")
+
 		return
 	}
 
-	err = pol.validate()
-	if err != nil {
-		if tf.Input.APIResponseBody != nil {
-			wantMsg := tf.Input.APIResponseBody.Message
-			if wantMsg != "" {
-				assertACLErrorContains(
-					t, err, wantMsg, tf.TestID,
-				)
-			}
+	// An emitter that differs is aligned, not papered over with a
+	// translation table.
+	var want string
+	if tf.Input.APIResponseBody != nil {
+		want = tf.Input.APIResponseBody.Message
+	}
+
+	compatCheck(t, skips, key+"message", func() string {
+		if strings.Contains(err.Error(), want) {
+			return ""
 		}
 
-		return
-	}
-
-	t.Errorf(
-		"%s: expected error but policy parsed and validated successfully",
-		tf.TestID,
-	)
-}
-
-// assertACLErrorContains requires that headscale's error contains the
-// Tailscale SaaS error message exactly. Divergence means an emitter
-// needs to be aligned, not papered over with a translation table.
-func assertACLErrorContains(
-	t *testing.T,
-	err error,
-	wantMsg string,
-	testID string,
-) {
-	t.Helper()
-
-	errStr := err.Error()
-	if strings.Contains(errStr, wantMsg) {
-		return
-	}
-
-	t.Errorf(
-		"%s: error message mismatch\n"+
-			"  want (tailscale): %q\n"+
-			"  got  (headscale): %q",
-		testID,
-		wantMsg,
-		errStr,
-	)
+		return fmt.Sprintf("want (tailscale): %q\ngot  (headscale): %q", want, err.Error())
+	})
 }
 
 // testACLSuccess verifies that a valid policy produces the expected
@@ -343,6 +412,13 @@ func testACLSuccess(
 		tf.TestID,
 	)
 
+	// The manager adds the global merge and its caches on top of the
+	// per-node compile; nodes get their filter from it.
+	pm, err := NewPolicyManager(policyJSON, users, nodes.ViewSlice())
+	require.NoError(t, err, "%s: policy manager should load the policy", tf.TestID)
+
+	opts := append(cmpOptions(), cmpopts.EquateEmpty())
+
 	for nodeName, capture := range tf.Captures {
 		t.Run(nodeName, func(t *testing.T) {
 			node := findNodeByGivenName(nodes, nodeName)
@@ -355,37 +431,61 @@ func testACLSuccess(
 				return
 			}
 
-			// Compile headscale filter rules for this node
-			compiledRules := pol.compileFilterRulesForNode(
-				users,
-				node.View(),
-				nodes.ViewSlice(),
-			)
-
-			gotRules := policyutil.ReduceFilterRules(
-				node.View(),
-				compiledRules,
-			)
-
 			wantRules := capture.PacketFilterRules
+			key := tf.TestID + "/" + nodeName + "/filter"
 
-			// Compare
-			opts := append(
-				cmpOptions(),
-				cmpopts.EquateEmpty(),
-			)
-			if diff := cmp.Diff(
-				wantRules,
-				gotRules,
-				opts...,
-			); diff != "" {
-				t.Errorf(
-					"%s/%s: filter rules mismatch (-want +got):\n%s",
-					tf.TestID,
-					nodeName,
-					diff,
+			// Only the manager installs the allow-all default of a policy
+			// with neither acls nor grants.
+			compiles := pol.ACLs != nil || pol.Grants != nil
+			compiled := func() []tailcfg.FilterRule {
+				return policyutil.ReduceFilterRules(
+					node.View(),
+					pol.compileFilterRulesForNode(users, node.View(), nodes.ViewSlice()),
+					nodeAddrSet(nodes.ViewSlice()),
 				)
 			}
+
+			// How sources and their repeats are written is all this skip may hide.
+			if reason := aclSkipReasons[key]; reason == srcAddressForm || reason == srcAndSelfDstForm {
+				pmRules, err := pm.FilterForNode(node.View())
+				require.NoError(t, err)
+
+				want := sourcesAsRanges(t, wantRules)
+				if reason == srcAndSelfDstForm {
+					want = withoutRepeatedDsts(want)
+				}
+
+				assert.Empty(t, cmp.Diff(want, sourcesAsRanges(t, pmRules), opts...),
+					"manager filter differs in more than how it is written")
+
+				if compiles {
+					assert.Empty(t, cmp.Diff(want, sourcesAsRanges(t, compiled()), opts...),
+						"compiled filter differs in more than how it is written")
+				}
+			}
+
+			compatCheck(t, aclSkipReasons, key, func() string {
+				var diffs []string
+
+				if compiles {
+					gotRules := compiled()
+
+					if diff := cmp.Diff(wantRules, gotRules, opts...); diff != "" {
+						diffs = append(diffs, "filter rules mismatch (-want +got):\n"+diff)
+					}
+				}
+
+				pmRules, err := pm.FilterForNode(node.View())
+				if err != nil {
+					return err.Error()
+				}
+
+				if diff := cmp.Diff(wantRules, pmRules, opts...); diff != "" {
+					diffs = append(diffs, "policy manager filter rules mismatch (-want +got):\n"+diff)
+				}
+
+				return strings.Join(diffs, "\n")
+			})
 		})
 	}
 }

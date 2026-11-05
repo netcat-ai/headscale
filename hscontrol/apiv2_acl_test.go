@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2/humatest"
@@ -82,8 +84,10 @@ func TestAPIv2ACLContentNegotiation(t *testing.T) {
 
 	assert.Equal(t, "application/json", jsonResp.Header().Get("Content-Type"))
 	assert.Equal(t, "application/hujson", huResp.Header().Get("Content-Type"))
-	// Same bytes, same ETag — the ETag is over content, not type.
-	assert.Equal(t, jsonResp.Body.Bytes(), huResp.Body.Bytes())
+	// The default policy has comments: a JSON read must still parse. The ETag is
+	// over the stored bytes, not the type.
+	assert.True(t, json.Valid(jsonResp.Body.Bytes()), jsonResp.Body.String())
+	assert.Contains(t, huResp.Body.String(), "//")
 	assert.Equal(t, jsonResp.Header().Get("Etag"), huResp.Header().Get("Etag"))
 }
 
@@ -125,6 +129,17 @@ func TestAPIv2ACLSetHuJSONWithComments(t *testing.T) {
 	raw := api.Get("/api/v2/tailnet/-/acl", "Accept: application/hujson")
 	assert.Equal(t, policy, raw.Body.String())
 	assert.Equal(t, policyETagOf(policy), raw.Header().Get("Etag"))
+}
+
+// TestAPIv2ACLSetBodyLimited: huma gives a RawBody input no size limit of its
+// own, so setACL must declare one.
+func TestAPIv2ACLSetBodyLimited(t *testing.T) {
+	app := createTestApp(t)
+	api := registerAPIV2(t, app)
+
+	set := setACL(t, api, allowAllPolicy+strings.Repeat(" ", 1<<20), "application/json")
+	assert.Equal(t, http.StatusRequestEntityTooLarge, set.Code)
+	assert.Empty(t, storedPolicy(t, app))
 }
 
 func TestAPIv2ACLETagChangesOnChangeStableOnNoop(t *testing.T) {
@@ -190,9 +205,21 @@ func TestAPIv2ACLInvalidPolicyAtomicity(t *testing.T) {
 	goodETag := good.Header().Get("Etag")
 
 	// Malformed body -> 400, and the stored policy is unchanged (atomicity).
-	bad := setACL(t, api, `{ this is not valid`, "application/json")
+	const malformed = `{ this is not valid`
+
+	bad := setACL(t, api, malformed, "application/json")
 	assert.Equal(t, http.StatusBadRequest, bad.Code)
-	assert.Contains(t, bad.Body.String(), `"message"`)
+
+	var answer struct {
+		Message string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(bad.Body.Bytes(), &answer))
+
+	reason := app.state.ValidatePolicy([]byte(malformed))
+	require.Error(t, reason)
+	assert.Equal(t, reason.Error(), answer.Message,
+		"the answer gives the parser's reason as it is")
+	assert.NotContains(t, answer.Message, "invalid policy")
 	assert.JSONEq(t, allowAllPolicy, storedPolicy(t, app))
 
 	// Wire-level: GET still serves the good policy + its ETag (no drift).
@@ -201,12 +228,140 @@ func TestAPIv2ACLInvalidPolicyAtomicity(t *testing.T) {
 	assert.JSONEq(t, allowAllPolicy, storedPolicy(t, app))
 }
 
+func TestAPIv2ACLPersistFailureKeepsLivePolicy(t *testing.T) {
+	app := createTestApp(t)
+	api := registerAPIV2(t, app)
+
+	require.Equal(t, http.StatusOK,
+		setACL(t, api, `{"acls":[]}`, "application/json").Code)
+
+	before, _ := app.state.Filter()
+
+	require.NoError(t,
+		app.state.DB().DB.Exec("ALTER TABLE policies RENAME TO policies_away").Error)
+
+	assert.Equal(t, http.StatusInternalServerError,
+		setACL(t, api, allowAllPolicy, "application/json").Code)
+
+	after, _ := app.state.Filter()
+	assert.Equal(t, before, after, "an unstored policy must not be enforced")
+}
+
+// TestAPIv2ACLRefusalEnvelope: a refused policy answers with the reason in
+// message and, when tests fail, one data entry per failing test naming its
+// src.
+func TestAPIv2ACLRefusalEnvelope(t *testing.T) {
+	app := createTestApp(t)
+	app.state.CreateUserForTest("alice")
+	api := registerAPIV2(t, app)
+
+	type refusal struct {
+		Message string `json:"message"`
+		Data    []struct {
+			User   string   `json:"user"`
+			Errors []string `json:"errors"`
+		} `json:"data"`
+	}
+
+	decode := func(resp *httptest.ResponseRecorder) refusal {
+		t.Helper()
+		require.Equalf(t, http.StatusBadRequest, resp.Code, "body: %s", resp.Body)
+
+		var r refusal
+		require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &r))
+
+		return r
+	}
+
+	parse := decode(setACL(t, api, `{ this is not valid`, "application/json"))
+	assert.NotEmpty(t, parse.Message)
+	assert.NotEqual(t, "setting policy", parse.Message, "the reason is the message")
+	assert.Empty(t, parse.Data)
+
+	tests := decode(setACL(t, api, `{
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
+		"tests": [
+			{"src": "alice@", "deny": ["100.64.0.2:22"]},
+			{"src": "100.64.0.1", "accept": ["100.64.0.2:22"]},
+			{"src": "100.64.0.3", "deny": ["100.64.0.2:22", "100.64.0.4:22"]}
+		]
+	}`, "application/json"))
+	assert.Equal(t, "test(s) failed", tests.Message)
+	require.Len(t, tests.Data, 2)
+	assert.Equal(t, "alice", tests.Data[0].User)
+	assert.Len(t, tests.Data[0].Errors, 1)
+	assert.Equal(t, "100.64.0.3", tests.Data[1].User)
+	assert.Len(t, tests.Data[1].Errors, 2)
+}
+
+// TestAPIv2ACLValidate: validate stores nothing and answers a refused policy
+// with 200, its reason as message and one data entry per failing test; only
+// a body with no policy at all is a 400.
+func TestAPIv2ACLValidate(t *testing.T) {
+	app := createTestApp(t)
+	app.state.CreateUserForTest("alice")
+	api := registerAPIV2(t, app)
+
+	type verdict struct {
+		Message string `json:"message"`
+		Data    []struct {
+			User   string   `json:"user"`
+			Errors []string `json:"errors"`
+		} `json:"data"`
+	}
+
+	validate := func(body string, wantStatus int) verdict {
+		t.Helper()
+
+		resp := api.Post("/api/v2/tailnet/-/acl/validate",
+			bytes.NewReader([]byte(body)), "Content-Type: application/hujson")
+		require.Equalf(t, wantStatus, resp.Code, "body: %s", resp.Body)
+
+		var v verdict
+		require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &v))
+
+		return v
+	}
+
+	for _, empty := range []string{"", " \n\t"} {
+		assert.Equal(t, "unexpected end of JSON input",
+			validate(empty, http.StatusBadRequest).Message)
+	}
+
+	assert.Equal(t, verdict{}, validate(allowAllPolicy, http.StatusOK))
+	assert.NotEmpty(t, validate(`{"acls": [`, http.StatusOK).Message)
+
+	failed := validate(`{
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
+		"tests": [{"src": "alice@", "deny": ["100.64.0.2:22"]}]
+	}`, http.StatusOK)
+	assert.Equal(t, "test(s) failed", failed.Message)
+	require.Len(t, failed.Data, 1)
+	assert.Equal(t, "alice", failed.Data[0].User)
+	assert.NotEmpty(t, failed.Data[0].Errors)
+
+	_, err := app.state.GetPolicy()
+	require.ErrorIs(t, err, types.ErrPolicyNotFound, "validate stores nothing")
+}
+
 func TestAPIv2ACLNonDefaultTailnet404(t *testing.T) {
 	api := registerAPIV2(t, createTestApp(t))
 
 	assert.Equal(t, http.StatusNotFound, api.Get("/api/v2/tailnet/example.com/acl").Code)
 	assert.Equal(t, http.StatusNotFound,
 		api.Post("/api/v2/tailnet/example.com/acl", bytes.NewReader([]byte(allowAllPolicy))).Code)
+}
+
+// TestAPIv2ACLUnknownPolicyMode: the handler's 500 carries a nil error detail,
+// which the error transformer must not dereference.
+func TestAPIv2ACLUnknownPolicyMode(t *testing.T) {
+	cfg := &types.Config{Policy: types.PolicyConfig{Mode: "unknown"}}
+	_, api := humatest.New(t, apiv2.Config())
+	apiv2.Register(api, apiv2.Backend{Cfg: cfg})
+
+	get := api.Get("/api/v2/tailnet/-/acl")
+	assert.Equal(t, http.StatusInternalServerError, get.Code)
+	assert.Contains(t, get.Body.String(), "unsupported policy mode")
 }
 
 func TestAPIv2ACLFileModeReadOnly(t *testing.T) {
@@ -220,7 +375,7 @@ func TestAPIv2ACLFileModeReadOnly(t *testing.T) {
 	apiv2.Register(api, apiv2.Backend{Cfg: cfg})
 
 	// GET serves the file bytes + their ETag.
-	get := api.Get("/api/v2/tailnet/-/acl")
+	get := api.Get("/api/v2/tailnet/-/acl", "Accept: application/hujson")
 	require.Equalf(t, http.StatusOK, get.Code, "body: %s", get.Body)
 	assert.Equal(t, fileBytes, get.Body.String())
 	assert.Equal(t, policyETagOf(fileBytes), get.Header().Get("Etag"))

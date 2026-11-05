@@ -12,7 +12,6 @@ package mapper
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -274,7 +273,7 @@ func TestAddToBatchDifferential(t *testing.T) {
 		lb.b.nodes.Store(99, nil)
 	}
 
-	endpoint := change.EndpointOrDERPUpdate(1, &tailcfg.PeerChange{
+	endpoint := change.EndpointOrDERPUpdate(&tailcfg.PeerChange{
 		NodeID: 1, DERPRegion: 7, Online: new(true),
 	})
 	ping := change.PingNode(2, &tailcfg.PingRequest{URL: "https://example.com/one"})
@@ -288,11 +287,11 @@ func TestAddToBatchDifferential(t *testing.T) {
 			change.SelfUpdate(88), ping, change.NodeOnline(2),
 		}},
 		{"repeated_kinds", []change.Change{
-			change.NodeOnline(2), change.NodeOffline(2), change.NodeOnline(2),
+			change.NodeOnline(2), change.NodeOffline(2, time.Time{}), change.NodeOnline(2),
 			change.PeersChanged("several peers", 3, 1),
 		}},
 		{"deletion", []change.Change{
-			change.NodeRemoved(4), change.SelfUpdate(4), change.PeersRemoved(3),
+			change.NodeRemoved(4, 1)[1], change.SelfUpdate(4), change.PeersRemoved(3),
 		}},
 		{
 			"full_with_pings",
@@ -360,7 +359,7 @@ func TestAddToBatchRecipientStorage(t *testing.T) {
 			lb := setupLightweightBatcher(t, 2, 1)
 			t.Cleanup(lb.cleanup)
 
-			incoming := []change.Change{change.NodeOnline(1), change.NodeOffline(1)}
+			incoming := []change.Change{change.NodeOnline(1), change.NodeOffline(1, time.Time{})}
 			impl.add(lb.b, incoming...)
 			incoming[0] = change.FullUpdate()
 
@@ -371,7 +370,7 @@ func TestAddToBatchRecipientStorage(t *testing.T) {
 
 			assert.Equal(
 				t,
-				[]change.Change{change.NodeOnline(1), change.NodeOffline(1)},
+				[]change.Change{change.NodeOnline(1), change.NodeOffline(1, time.Time{})},
 				getPendingForNode(lb.b, 2),
 				"recipients must own their pending slices",
 			)
@@ -511,7 +510,7 @@ func TestAddToBatch_NodeRemovalCleanup(t *testing.T) {
 	_, exists := lb.b.nodes.Load(removedNode)
 	require.True(t, exists, "node 3 should exist before removal")
 
-	lb.b.addToBatch(change.NodeRemoved(removedNode))
+	lb.b.addToBatch(change.NodeRemoved(removedNode)...)
 
 	// Node should be removed from the nodes map
 	_, exists = lb.b.nodes.Load(removedNode)
@@ -1150,52 +1149,30 @@ func TestBug6_StartCalledMultipleTimes_GoroutineLeak(t *testing.T) {
 	lb := setupLightweightBatcher(t, 3, 10)
 	lb.b.workers = 2
 
-	goroutinesBefore := runtime.NumGoroutine()
-
 	// Call Start() once - this should launch (workers + 1) goroutines
 	// (1 for doWork + workers for worker())
-	lb.b.Start()
-	time.Sleep(50 * time.Millisecond) //nolint:forbidigo // concurrency test coordination
-
-	goroutinesAfterFirst := runtime.NumGoroutine()
-	firstStartDelta := goroutinesAfterFirst - goroutinesBefore
-	t.Logf("goroutines: before=%d, after_first_Start=%d, delta=%d",
-		goroutinesBefore, goroutinesAfterFirst, firstStartDelta)
+	startLabelled(lb.b, t.Name())
+	require.Eventually(t, func() bool {
+		return batcherGoroutines(t.Name()) == 3
+	}, time.Second, 5*time.Millisecond, "first Start() should run doWork + 2 workers")
 
 	// Call Start() again - this SHOULD be a no-op
 	// BUG: it creates a NEW done channel (orphaning goroutines listening on the old one)
 	// and launches another doWork()+workers set
-	lb.b.Start()
+	startLabelled(lb.b, t.Name())
+	startLabelled(lb.b, t.Name())
 	time.Sleep(50 * time.Millisecond) //nolint:forbidigo // concurrency test coordination
 
-	goroutinesAfterSecond := runtime.NumGoroutine()
-	secondStartDelta := goroutinesAfterSecond - goroutinesAfterFirst
-	t.Logf("goroutines: after_second_Start=%d, delta=%d (should be 0)",
-		goroutinesAfterSecond, secondStartDelta)
+	extra := batcherGoroutines(t.Name()) - 3
 
-	// Call Start() a third time
-	lb.b.Start()
-	time.Sleep(50 * time.Millisecond) //nolint:forbidigo // concurrency test coordination
-
-	goroutinesAfterThird := runtime.NumGoroutine()
-	thirdStartDelta := goroutinesAfterThird - goroutinesAfterSecond
-	t.Logf("goroutines: after_third_Start=%d, delta=%d (should be 0)",
-		goroutinesAfterThird, thirdStartDelta)
-
-	// Close() only closes the LAST done channel, leaving earlier goroutines leaked
 	lb.b.Close()
-	time.Sleep(100 * time.Millisecond) //nolint:forbidigo // concurrency test coordination
-
-	goroutinesAfterClose := runtime.NumGoroutine()
-	t.Logf("goroutines after Close: %d (leaked: %d)",
-		goroutinesAfterClose, goroutinesAfterClose-goroutinesBefore)
 
 	// Second Start() should NOT have created new goroutines
-	assert.Zero(t, secondStartDelta,
-		"BUG #6: second Start() call leaked %d goroutines. "+
+	assert.Zero(t, extra,
+		"BUG #6: repeated Start() calls leaked %d goroutines. "+
 			"Start() has no idempotency guard, each call spawns new goroutines. "+
 			"Fix: add sync.Once or atomic.Bool to prevent multiple Start() calls",
-		secondStartDelta)
+		extra)
 }
 
 // TestBug7_CleanupOfflineNodes_PendingChangesCleanedStructurally verifies that

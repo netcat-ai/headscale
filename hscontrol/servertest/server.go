@@ -5,7 +5,11 @@
 package servertest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -16,6 +20,7 @@ import (
 	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"tailscale.com/net/memnet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
@@ -34,6 +39,7 @@ type TestServer struct {
 	ln         net.Listener
 	httpServer *http.Server
 	st         *state.State
+	cfg        *types.Config
 }
 
 // ServerOption configures a [TestServer].
@@ -52,6 +58,7 @@ type serverConfig struct {
 	magicDNSDomain        string
 	dnsResolvers          []string
 	certProvider          hsdns.Provider
+	prefixV4              netip.Prefix
 }
 
 func defaultServerConfig() *serverConfig {
@@ -61,6 +68,7 @@ func defaultServerConfig() *serverConfig {
 		batcherWorkers:   1,
 		ephemeralTimeout: 30 * time.Second,
 		taildropEnabled:  true,
+		prefixV4:         netip.MustParsePrefix("100.64.0.0/10"),
 	}
 }
 
@@ -119,6 +127,11 @@ func WithMagicDNS(domain string) ServerOption {
 	return func(c *serverConfig) { c.magicDNSDomain = domain }
 }
 
+// WithPrefixV4 sets prefixes.v4, the range node IPv4 addresses come from.
+func WithPrefixV4(p netip.Prefix) ServerOption {
+	return func(c *serverConfig) { c.prefixV4 = p }
+}
+
 // WithCertificates enables node certificates (dns.certificates) with
 // provider publishing the challenges. It needs [WithMagicDNS]; the
 // propagation check is off because the provider is not real DNS.
@@ -151,7 +164,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 
 	tmpDir := tb.TempDir()
 
-	prefixV4 := netip.MustParsePrefix("100.64.0.0/10")
+	prefixV4 := sc.prefixV4
 	prefixV6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 
 	cfg := types.Config{
@@ -276,6 +289,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 		ln:         ln,
 		httpServer: httpServer,
 		st:         app.GetState(),
+		cfg:        &cfg,
 	}
 
 	tb.Cleanup(ts.Close)
@@ -308,6 +322,15 @@ func (s *TestServer) MemNet() *memnet.Network {
 	return s.memNet
 }
 
+// SetExtraRecords replaces the extra DNS records and sends them to every
+// node, as a reload of dns.extra_records_path does. The server needs
+// [WithMagicDNS] or [WithDNSResolvers], which give it a DNS config to hold
+// them.
+func (s *TestServer) SetExtraRecords(records []tailcfg.DNSRecord) {
+	s.cfg.SetExtraRecords(records)
+	s.App.Change(change.ExtraRecords())
+}
+
 // CreateUser creates a test user and returns it.
 func (s *TestServer) CreateUser(tb testing.TB, name string) *types.User {
 	tb.Helper()
@@ -318,6 +341,44 @@ func (s *TestServer) CreateUser(tb testing.TB, name string) *types.User {
 	}
 
 	return u
+}
+
+// ApproveAuth registers the pending login authID to user through the v1
+// API, as `headscale auth register` does.
+func (s *TestServer) ApproveAuth(ctx context.Context, authID, user string) error {
+	apiKey, _, err := s.st.CreateAPIKey(nil)
+	if err != nil {
+		return fmt.Errorf("servertest: ApproveAuth: %w", err)
+	}
+
+	body, err := json.Marshal(map[string]string{"authId": authID, "user": user})
+	if err != nil {
+		return fmt.Errorf("servertest: ApproveAuth: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL+"/api/v1/auth/register", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("servertest: ApproveAuth: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Transport: &http.Transport{DialContext: s.memNet.Dial}}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("servertest: ApproveAuth: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+
+		return fmt.Errorf("servertest: ApproveAuth: %d: %s", resp.StatusCode, bytes.TrimSpace(msg)) //nolint:err113
+	}
+
+	return nil
 }
 
 // CreateAPIKey mints an API key string (the Bearer/Basic credential). When
@@ -349,9 +410,17 @@ func (s *TestServer) CreateRegisteredNode(tb testing.TB, owner *types.User, host
 	tb.Helper()
 
 	node := s.st.CreateRegisteredNodeForTest(owner, hostname...)
-	// CreateRegisteredNodeForTest sets UserID but leaves the User association
-	// unloaded; the device response renders the owner login, so attach it.
+	// CreateRegisteredNodeForTest sets UserID and AuthKeyID but leaves the
+	// associations unloaded; the device response renders the owner login and,
+	// once tagged, the login that made its key, so attach both.
 	node.User = owner
+
+	pak, err := s.st.GetPreAuthKeyByID(*node.AuthKeyID)
+	if err != nil {
+		tb.Fatalf("servertest: GetPreAuthKeyByID: %v", err)
+	}
+
+	node.AuthKey = pak.AsCredential()
 
 	return s.st.PutNodeInStoreForTest(*node)
 }

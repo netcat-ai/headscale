@@ -186,8 +186,6 @@ func TestConnectDisconnectSubnetRouterEmitsPolicyChangeNotFull(t *testing.T) {
 
 		assert.NotEmpty(t, runtimePeerComputationReasons(cs),
 			"subnet router must still drive a runtime peer recompute")
-		assert.True(t, hasPeerPatch(cs),
-			"subnet router should still emit the lightweight online/offline patch")
 
 		for _, c := range cs {
 			assert.Falsef(t, c.IsFull(),
@@ -200,6 +198,8 @@ func TestConnectDisconnectSubnetRouterEmitsPolicyChangeNotFull(t *testing.T) {
 		require.NotZero(t, epoch)
 
 		assertRecomputeNotFull(t, cs)
+		assert.True(t, hasPeerPatch(cs),
+			"subnet router should still emit the lightweight online patch")
 	})
 
 	t.Run("disconnect", func(t *testing.T) {
@@ -207,7 +207,43 @@ func TestConnectDisconnectSubnetRouterEmitsPolicyChangeNotFull(t *testing.T) {
 		cs := drainSessions(t, s, nodeID, epoch)
 
 		assertRecomputeNotFull(t, cs)
+		assert.False(t, hasPeerPatch(cs),
+			"the recompute carries the offline state, so one frame moves the routes")
 	})
+}
+
+// TestReconnectWhileOnlineAnnouncesNothing pins that a stream which comes
+// back while an earlier session still holds the node online, as in the
+// reconnect grace, tells peers nothing and recomputes nothing, as on Tailscale
+// SaaS; once the node went offline, the next connect announces it again.
+func TestReconnectWhileOnlineAnnouncesNothing(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
+		n.ApprovedRoutes = []netip.Prefix{route}
+	})
+	require.True(t, ok)
+
+	cs, first := s.Connect(nodeID)
+	require.True(t, forcesPeerRecompute(cs))
+
+	cs, second := s.Connect(nodeID)
+	assert.Empty(t, cs, "a reconnect while online must change nothing peers see")
+
+	cs, err := s.Disconnect(nodeID, first)
+	require.NoError(t, err)
+	require.Empty(t, cs)
+
+	cs, err = s.Disconnect(nodeID, second)
+	require.NoError(t, err)
+	require.True(t, forcesPeerRecompute(cs))
+
+	cs, _ = s.Connect(nodeID)
+	assert.True(t, hasPeerPatch(cs), "a node that went offline must be announced online")
+	assert.True(t, forcesPeerRecompute(cs))
 }
 
 // drainSessions releases poll sessions on nodeID until the node goes

@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -261,6 +263,39 @@ func TestShuffleDERPMapDeterministic(t *testing.T) {
 	}
 }
 
+// TestGetDERPMapKeepsOrderAcrossRefreshes: clients close their home relay when
+// its node order changes, so a refresh of the same input must keep the order.
+func TestGetDERPMapKeepsOrderAcrossRefreshes(t *testing.T) {
+	viper.Set("dns.base_domain", "stable.example.com")
+
+	defer viper.Reset()
+
+	resetDerpRandomForTesting()
+
+	source := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
+
+	for id := range tailcfg.DERPRegionID(5) {
+		region := &tailcfg.DERPRegion{RegionID: id + 1}
+		for _, name := range []string{"a", "b", "c", "d", "e"} {
+			region.Nodes = append(region.Nodes, &tailcfg.DERPNode{Name: name, RegionID: id + 1})
+		}
+
+		source.Regions[id+1] = region
+	}
+
+	first, err := GetDERPMap(types.DERPConfig{DERPMap: source})
+	require.NoError(t, err)
+
+	for range 5 {
+		next, err := GetDERPMap(types.DERPConfig{DERPMap: source})
+		require.NoError(t, err)
+
+		if diff := cmp.Diff(first, next); diff != "" {
+			t.Fatalf("refresh changed the DERP map (-first +next):\n%s", diff)
+		}
+	}
+}
+
 func TestShuffleDERPMapEdgeCases(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -399,7 +434,9 @@ func TestLoadDERPMapFromPath(t *testing.T) {
 			content: "{regions: {999: {regionid: 999, regioncode: test, nodes: [{name: 999a, regionid: 999, hostname: derp.test, derpport: 443, insecurefortests: true}]}}}",
 		},
 		{name: "tailcfg json", file: "derp.json", content: string(tailcfgJSON)},
+		{name: "tailcfg json with comments and trailing comma", file: "derp.json", content: "// test map\n" + strings.TrimSuffix(string(tailcfgJSON), "}") + ",}"},
 		{name: "tailcfg hujson", file: "derp.hujson", content: "// test map\n" + string(tailcfgJSON)},
+		{name: "tailcfg json with unterminated comment", file: "derp.json", content: string(tailcfgJSON) + " /*", wantErr: true},
 		{name: "json as yaml decodes to nothing", file: "derp.yaml", content: string(tailcfgJSON), wantErr: true},
 		{name: "empty", file: "derp.yaml", content: "", wantErr: true},
 		{name: "no extension", file: "derp", content: yamlMap, wantErr: true},

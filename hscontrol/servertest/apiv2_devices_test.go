@@ -1,7 +1,11 @@
 package servertest_test
 
 import (
+	"cmp"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -13,6 +17,7 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -147,12 +152,15 @@ func apiv2DevicesGoClient(t *testing.T, srv *servertest.TestServer, baseURL, api
 	require.NoError(t, dr.SetKey(ctx, deviceID, tsclient.DeviceKey{KeyExpiryDisabled: false}))
 	assert.False(t, srvNodeView(t, srv, id).Expiry().Valid())
 
-	// SetTags — flips ownership to the tags; the user is dropped.
+	// SetTags — flips ownership to the tags; the user is dropped, and the
+	// device shows the login that made its key.
+	joinedBy := dev.User
+
 	require.NoError(t, dr.SetTags(ctx, deviceID, []string{"tag:ci"}))
 	dev, err = dr.Get(ctx, deviceID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"tag:ci"}, dev.Tags)
-	assert.Equal(t, types.TaggedDevices.Username(), dev.User)
+	assert.Equal(t, joinedBy, dev.User)
 	n := srvNodeView(t, srv, id)
 	assert.True(t, n.IsTagged())
 	assert.Equal(t, []string{"tag:ci"}, n.Tags().AsSlice())
@@ -353,17 +361,6 @@ func apiv2SettingsTSCLI(t *testing.T, baseURL, apiKey string) {
 // devicesACLTFConfig exercises Terraform device + ACL data sources AND resources.
 // %s is the test node's hostname (the tailscale_device data source key).
 const devicesACLTFConfig = `
-terraform {
-  required_providers {
-    tailscale = {
-      source  = "tailscale/tailscale"
-      version = "~> 0.21"
-    }
-  }
-}
-
-provider "tailscale" {}
-
 resource "tailscale_acl" "policy" {
   acl = jsonencode({
     tagOwners = { "tag:ci" = ["apiv2@"] }
@@ -417,10 +414,10 @@ output "enabled_routes" { value = tailscale_device_subnet_routes.dut.routes }
 // outputs (read path) against the server truth, and the resulting server state
 // (write path). parallelism=1 avoids racing concurrent mutations on the one
 // shared node.
-func apiv2DevicesACLTerraform(t *testing.T, srv *servertest.TestServer, baseURL, apiKey, hostname string, id types.NodeID) {
+func apiv2DevicesACLTerraform(t *testing.T, version string, srv *servertest.TestServer, baseURL, apiKey, hostname string, id types.NodeID) {
 	t.Helper()
 
-	tf := newTofu(t, baseURL, apiKey, fmt.Sprintf(devicesACLTFConfig, hostname))
+	tf := newTofu(t, version, baseURL, apiKey, fmt.Sprintf(devicesACLTFConfig, hostname))
 
 	tf.run("init", "-no-color", "-input=false")
 	tf.run("apply", "-auto-approve", "-no-color", "-input=false", "-parallelism=1")
@@ -454,4 +451,225 @@ func apiv2DevicesACLTerraform(t *testing.T, srv *servertest.TestServer, baseURL,
 
 	_, ok := srv.State().GetNodeByID(id)
 	assert.True(t, ok, "data-source node persists across destroy")
+}
+
+// TestAPIV2TaggedDeviceUserCompat replays the setup step of the user-role
+// capture, where odin and freya each join an untagged and a tag:server node
+// with keys they minted, and compares each device's user and tags in
+// headscale's v2 device list with SaaS's.
+//
+// Test data source: testdata/steps/user-role.hujson, loaded by name; its
+// role steps are TestUserChangeDispatchCompat's.
+func TestAPIV2TaggedDeviceUserCompat(t *testing.T) {
+	t.Parallel()
+
+	t.Run(userRoleID, func(t *testing.T) {
+		t.Parallel()
+
+		c := readStepCapture(t, userRoleID)
+		r := newStepReplay(t, c)
+		step := c.Steps[0]
+		require.Equal(t, userRoleSetup, step.Name)
+		requireUserRoleResult(t, step)
+
+		r.applyUserRole(t, step)
+
+		evaluated := map[string]bool{}
+		holdChecks(t, mapStreamSkipReasons, userRoleID+"/"+step.Name+"/", deviceListChecks(t, r, step), evaluated)
+
+		for k := range mapStreamSkipReasons {
+			if strings.HasPrefix(k, userRoleID+"/") && deviceListCheck(k) && !evaluated[k] {
+				t.Errorf("skip entry %q names no check", k)
+			}
+		}
+	})
+}
+
+// TestNoChangePolicyWrite: SaaS sent nothing for the accepted writes in
+// policy-api that changed nothing. An approval to skip an SSH check must also
+// outlive such a write, as any rewrite by a gitops tool would otherwise drop it.
+func TestNoChangePolicyWrite(t *testing.T) {
+	t.Parallel()
+
+	const (
+		policy = `{"tagOwners":{"tag:server":["odin@"]},"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`
+		other  = `{"tagOwners":{"tag:server":["odin@"]},"acls":[{"action":"accept","src":["*"],"dst":["tag:server:22"]}]}`
+	)
+
+	srv := servertest.NewServer(t)
+	odin := srv.CreateUser(t, "odin")
+	key := srv.CreateAPIKey(t, odin)
+
+	post := func(body string) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v2/tailnet/-/acl", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/hujson")
+
+		rec := httptest.NewRecorder()
+		srv.App.HTTPHandler().ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	post(policy)
+
+	desk := servertest.NewClient(t, srv, "desk", servertest.WithUser(odin))
+	server := servertest.NewClient(t, srv, "server", servertest.WithUser(odin), servertest.WithTags("tag:server"))
+	desk.WaitForPeers(t, 1, 20*time.Second)
+	server.WaitForPeers(t, 1, 20*time.Second)
+
+	src := types.NodeID(desk.Netmap().SelfNode.ID())   //nolint:gosec // test node IDs are small
+	dst := types.NodeID(server.Netmap().SelfNode.ID()) //nolint:gosec // test node IDs are small
+	srv.State().SetLastSSHAuth(src, dst)
+
+	// Late frames from the joins settle first.
+	var frames, steady int
+
+	require.Eventually(t, func() bool {
+		if n := desk.Frames(); n != frames {
+			frames, steady = n, 0
+
+			return false
+		}
+
+		steady++
+
+		return steady >= 10
+	}, 20*time.Second, 200*time.Millisecond, "frames settle after the joins")
+
+	post(policy)
+
+	assert.Never(t, func() bool { return desk.Frames() != frames }, 2*time.Second, 100*time.Millisecond,
+		"frames after a write that changes nothing")
+
+	_, kept := srv.State().GetLastSSHAuth(src, dst)
+	assert.True(t, kept, "SSH check approval after a write that changes nothing")
+
+	post(other)
+
+	assert.Eventually(t, func() bool { return desk.Frames() > frames }, 10*time.Second, 100*time.Millisecond,
+		"a write that changes the policy still reaches clients")
+
+	_, kept = srv.State().GetLastSSHAuth(src, dst)
+	assert.False(t, kept, "a changed policy drops SSH check approvals")
+}
+
+// TestAPIV2DevicePresence: Tailscale's SDK says lastSeen is nil while connected,
+// but SaaS sends it on every device, so a tool reads it without a nil check.
+func TestAPIV2DevicePresence(t *testing.T) {
+	t.Parallel()
+
+	// Clients dial the in-memory network, so the SDK gets its own listener.
+	srv := servertest.NewServer(t)
+	api := httptest.NewServer(srv.App.HTTPHandler())
+	t.Cleanup(api.Close)
+
+	owner := srv.CreateUser(t, "apiv2")
+	apiKey := srv.CreateAPIKey(t, owner)
+	client := servertest.NewClient(t, srv, "presence", servertest.WithUser(owner))
+
+	read := func(c *assert.CollectT) *tsclient.Device {
+		devices, err := goClient(t, api.URL, apiKey).Devices().List(t.Context())
+		if err != nil {
+			assert.Fail(c, "listing devices", err.Error())
+
+			return nil
+		}
+
+		if !assert.Len(c, devices, 1) {
+			return nil
+		}
+
+		return &devices[0]
+	}
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		d := read(c)
+		if d == nil {
+			return
+		}
+
+		assert.True(c, d.ConnectedToControl)
+
+		if assert.NotNil(c, d.LastSeen) {
+			assert.WithinDuration(c, time.Now(), d.LastSeen.Time, time.Minute)
+		}
+	}, 20*time.Second, 200*time.Millisecond, "connected device")
+
+	client.Disconnect(t)
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		d := read(c)
+		if d == nil {
+			return
+		}
+
+		assert.False(c, d.ConnectedToControl)
+		assert.NotNil(c, d.LastSeen)
+	}, 30*time.Second, 200*time.Millisecond, "device that left")
+}
+
+// deviceListChecks compares, per device in the step's device list, its user,
+// SaaS emails mapped to user names, its tags, whether it is connected, and
+// whether it has a last seen time.
+func deviceListChecks(t *testing.T, r *stepReplay, step testcapture.Step) []stepCheck {
+	t.Helper()
+
+	hsDevice := func(alias string) (saasDevice, string) {
+		nodes := r.machineNodes(alias)
+		if len(nodes) != 1 {
+			return saasDevice{}, fmt.Sprintf("devices %d", len(nodes))
+		}
+
+		status, body := r.call(t, http.MethodGet, "/api/v2/tailnet/-/devices?fields=all", nil)
+		if status != http.StatusOK {
+			return saasDevice{}, fmt.Sprintf("status %d", status)
+		}
+
+		var list struct {
+			Devices []saasDevice `json:"devices"`
+		}
+		require.NoError(t, json.Unmarshal(body, &list))
+
+		for _, d := range list.Devices {
+			if d.ID == nodes[0].StringID() {
+				return d, ""
+			}
+		}
+
+		return saasDevice{}, "not listed"
+	}
+
+	devices := stepDevices(t, step)
+	checks := make([]stepCheck, 0, 4*len(devices))
+
+	for _, d := range devices {
+		x := deviceLabelAlias(d.ID)
+		user, ok := captureUserNames[d.User]
+		require.True(t, ok, "%s: %s's user %q is not a capture user", step.Name, x, d.User)
+
+		checks = append(checks,
+			stepCheck{x + "/device-user", user, func() string {
+				got, missing := hsDevice(x)
+
+				return cmp.Or(missing, got.User)
+			}},
+			stepCheck{x + "/device-tags", sortedStrings(d.Tags), func() string {
+				got, missing := hsDevice(x)
+
+				return cmp.Or(missing, sortedStrings(got.Tags))
+			}},
+			stepCheck{x + "/device-connected", strconv.FormatBool(d.ConnectedToControl), func() string {
+				got, missing := hsDevice(x)
+
+				return cmp.Or(missing, strconv.FormatBool(got.ConnectedToControl))
+			}},
+			stepCheck{x + "/device-last-seen", strconv.FormatBool(d.LastSeen != nil), func() string {
+				got, missing := hsDevice(x)
+
+				return cmp.Or(missing, strconv.FormatBool(got.LastSeen != nil))
+			}},
+		)
+	}
+
+	return checks
 }

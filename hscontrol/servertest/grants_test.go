@@ -3,10 +3,13 @@ package servertest_test
 import (
 	"context"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -204,9 +207,6 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		c2.WaitForPeers(t, 1, 10*time.Second)
 
 		// Phase 1: Set a grant policy allowing only TCP port 22.
-		countC1 := c1.UpdateCount()
-		countC2 := c2.UpdateCount()
-
 		changed, err := srv.State().SetPolicy([]byte(`{
 			"grants": [{
 				"src": ["propagation-user@"],
@@ -222,24 +222,21 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 			srv.App.Change(changes...)
 		}
 
-		c1.WaitForCondition(t, "first grant policy update",
-			10*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				return c1.UpdateCount() > countC1
-			})
-		c2.WaitForCondition(t, "first grant policy update",
-			10*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				return c2.UpdateCount() > countC2
-			})
+		// Wait for the filter itself: any other frame, such as a peer's
+		// endpoint update, would also count as an update.
+		for _, c := range []*servertest.TestClient{c1, c2} {
+			c.WaitForCondition(t, "first grant policy update",
+				10*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					return hasDstPort(nm.PacketFilter, 22)
+				})
+		}
 
-		// Capture the update count after first policy.
+		// Keep the first policy's netmap to compare against.
 		nm1Before := c1.Netmap()
 		require.NotNil(t, nm1Before)
 		require.NotEmpty(t, nm1Before.PacketFilter,
 			"PacketFilter should have rules from first grant policy")
-
-		updateCountPhase1 := c1.UpdateCount()
 
 		// Phase 2: Change to a grant policy with app capability
 		// (structurally different from IP-only grant).
@@ -268,16 +265,13 @@ func TestGrantPolicies(t *testing.T) { //nolint:gocyclo
 		}
 
 		// Wait for the second policy update to arrive.
-		c1.WaitForCondition(t, "second grant policy update",
-			10*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				return c1.UpdateCount() > updateCountPhase1
-			})
-		c2.WaitForCondition(t, "second grant policy update",
-			10*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				return c2.UpdateCount() > countC2
-			})
+		for _, c := range []*servertest.TestClient{c1, c2} {
+			c.WaitForCondition(t, "second grant policy update",
+				10*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					return hasCapMatches(nm.PacketFilter)
+				})
+		}
 
 		// Verify the second policy added cap grants that weren't
 		// in the first (IP-only) policy.
@@ -1102,6 +1096,19 @@ func hasCapMatches(matches []filtertype.Match) bool {
 	return false
 }
 
+// hasDstPort reports whether any destination in matches is exactly port.
+func hasDstPort(matches []filtertype.Match, port uint16) bool {
+	for _, m := range matches {
+		for _, d := range m.Dsts {
+			if d.Ports.First == port && d.Ports.Last == port {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // hasDstRules returns true if any [filtertype.Match] in the slice contains a
 // non-empty Dsts list.
 func hasDstRules(matches []filtertype.Match) bool {
@@ -1112,4 +1119,151 @@ func hasDstRules(matches []filtertype.Match) bool {
 	}
 
 	return false
+}
+
+func TestGrantViaSubnetFailover(t *testing.T) {
+	t.Parallel()
+
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	setup := func(
+		t *testing.T,
+	) (*servertest.TestServer, map[string]*servertest.TestClient) {
+		t.Helper()
+
+		srv := servertest.NewServer(t)
+		user := srv.CreateUser(t, "via-ha-user")
+
+		changed, err := srv.State().SetPolicy([]byte(`{
+			"tagOwners": {
+				"tag:other": ["via-ha-user@"],
+				"tag:router": ["via-ha-user@"],
+				"tag:client": ["via-ha-user@"]
+			},
+			"grants": [{
+				"src": ["tag:client"],
+				"dst": ["10.0.0.0/24"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}],
+			"autoApprovers": {
+				"routes": {
+					"10.0.0.0/24": ["tag:other", "tag:router"]
+				}
+			}
+		}`))
+		require.NoError(t, err)
+
+		if changed {
+			changes, err := srv.State().ReloadPolicy()
+			require.NoError(t, err)
+			srv.App.Change(changes...)
+		}
+
+		clients := map[string]*servertest.TestClient{}
+
+		// Register the router outside the via group first to hold global primary.
+		for _, c := range []struct{ name, tag string }{
+			{"other", "tag:other"},
+			{"router-1", "tag:router"},
+			{"router-2", "tag:router"},
+			{"client", "tag:client"},
+		} {
+			clients[c.name] = servertest.NewClient(t, srv, c.name,
+				servertest.WithUser(user), servertest.WithTags(c.tag))
+		}
+
+		for _, name := range []string{"other", "router-1", "router-2"} {
+			clients[name].Direct().SetHostinfo(&tailcfg.Hostinfo{
+				BackendLogID: "servertest-" + name,
+				Hostname:     name,
+				RoutableIPs:  []netip.Prefix{route},
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			_ = clients[name].Direct().SendUpdate(ctx)
+
+			cancel()
+		}
+
+		return srv, clients
+	}
+
+	onlyHolder := func(want string) func(*netmap.NetworkMap) bool {
+		return func(nm *netmap.NetworkMap) bool {
+			var holders []string
+
+			for _, p := range nm.Peers {
+				if slices.Contains(p.AllowedIPs().AsSlice(), route) {
+					holders = append(holders, p.Hostinfo().Hostname())
+				}
+			}
+
+			return slices.Equal(holders, []string{want})
+		}
+	}
+
+	setExpiry := func(t *testing.T, srv *servertest.TestServer, id types.NodeID, expiry *time.Time) {
+		t.Helper()
+
+		_, c, err := srv.State().SetNodeExpiry(id, expiry)
+		require.NoError(t, err)
+		srv.App.Change(c)
+	}
+
+	for _, mode := range []string{"offline", "unhealthy", "expired"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+
+			srv, clients := setup(t)
+			clients["client"].WaitForCondition(t, "route on router-1",
+				15*time.Second, onlyHolder("router-1"))
+			otherID := findNodeID(t, srv, "other")
+			router1ID := findNodeID(t, srv, "router-1")
+			require.Contains(t, srv.State().GetNodePrimaryRoutes(otherID), route)
+
+			switch mode {
+			case "offline":
+				clients["router-1"].Disconnect(t)
+			case "unhealthy":
+				changed := srv.State().SetNodeHealth(router1ID, false)
+				require.True(t, changed, "a via health change must trigger a recompute")
+				srv.App.Change(change.PolicyChange())
+			case "expired":
+				setExpiry(t, srv, router1ID, new(time.Now().Add(-time.Minute)))
+			}
+
+			clients["client"].WaitForCondition(t, "route moves to router-2",
+				30*time.Second, onlyHolder("router-2"))
+			assert.Contains(t, srv.State().GetNodePrimaryRoutes(otherID), route)
+
+			switch mode {
+			case "offline":
+				clients["router-1"].Reconnect(t)
+			case "unhealthy":
+				changed := srv.State().SetNodeHealth(router1ID, true)
+				require.True(t, changed, "a via recovery must trigger a recompute")
+				srv.App.Change(change.PolicyChange())
+			case "expired":
+				setExpiry(t, srv, router1ID, nil)
+			}
+
+			// router-1 keeps its control session through health and expiry
+			// changes, so it is older than router-2 and takes the route
+			// back; a reconnect opens a newer one.
+			want := "router-1"
+			if mode == "offline" {
+				want = "router-2"
+			}
+
+			clients["client"].WaitForCondition(t, "route settles on "+want,
+				30*time.Second, func(nm *netmap.NetworkMap) bool {
+					router1Online := slices.ContainsFunc(nm.Peers, func(p tailcfg.NodeView) bool {
+						return p.Hostinfo().Hostname() == "router-1" && p.Online().Get()
+					})
+
+					return router1Online && onlyHolder(want)(nm)
+				})
+			assert.Contains(t, srv.State().GetNodePrimaryRoutes(otherID), route)
+		})
+	}
 }

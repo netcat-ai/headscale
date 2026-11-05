@@ -63,6 +63,12 @@ var TheInternet = sync.OnceValue(func() *netipx.IPSet {
 	return theInternetSet
 })
 
+// HasInternetDestination reports whether set contains any address in [TheInternet].
+// Exit routes provide a path; packet filters still restrict the permitted traffic.
+func HasInternetDestination(set *netipx.IPSet) bool {
+	return set.Overlaps(TheInternet())
+}
+
 // IPSetSubsetOf reports whether every prefix of candidate is contained in
 // container. A nil candidate or container returns false.
 func IPSetSubsetOf(candidate, container *netipx.IPSet) bool {

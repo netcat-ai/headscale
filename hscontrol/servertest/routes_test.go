@@ -2,17 +2,26 @@ package servertest_test
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"net/http"
 	"net/netip"
+	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/servertest"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/testcapture"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 )
 
 // TestRoutes verifies that route advertisements and approvals
@@ -51,54 +60,6 @@ func TestRoutes(t *testing.T) {
 		}
 	})
 
-	t.Run("advertised_routes_in_hostinfo", func(t *testing.T) {
-		t.Parallel()
-
-		srv := servertest.NewServer(t)
-		user := srv.CreateUser(t, "advroute-user")
-
-		routePrefix := netip.MustParsePrefix("192.168.1.0/24")
-
-		c1 := servertest.NewClient(t, srv, "advroute-node1",
-			servertest.WithUser(user))
-		c2 := servertest.NewClient(t, srv, "advroute-node2",
-			servertest.WithUser(user))
-
-		c1.WaitForPeers(t, 1, 10*time.Second)
-
-		// Update hostinfo with advertised routes.
-		c1.Direct().SetHostinfo(&tailcfg.Hostinfo{
-			BackendLogID: "servertest-advroute-node1",
-			Hostname:     "advroute-node1",
-			RoutableIPs:  []netip.Prefix{routePrefix},
-		})
-
-		// Send a non-streaming update to push the new [tailcfg.Hostinfo].
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		_ = c1.Direct().SendUpdate(ctx)
-
-		// The observer should eventually see the advertised routes
-		// in the peer's [tailcfg.Hostinfo].
-		c2.WaitForCondition(t, "advertised route in hostinfo",
-			15*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				for _, p := range nm.Peers {
-					hi := p.Hostinfo()
-					if hi.Valid() && hi.Hostname() == "advroute-node1" {
-						for i := range hi.RoutableIPs().Len() {
-							if hi.RoutableIPs().At(i) == routePrefix {
-								return true
-							}
-						}
-					}
-				}
-
-				return false
-			})
-	})
-
 	t.Run("route_advertise_and_approve", func(t *testing.T) {
 		t.Parallel()
 
@@ -125,22 +86,8 @@ func TestRoutes(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		_ = c1.Direct().SendUpdate(ctx)
-
-		// Wait for the server to process the [tailcfg.Hostinfo] update
-		// by waiting for observer to see the advertised route.
-		c2.WaitForCondition(t, "hostinfo update propagated",
-			10*time.Second,
-			func(nm *netmap.NetworkMap) bool {
-				for _, p := range nm.Peers {
-					hi := p.Hostinfo()
-					if hi.Valid() && hi.Hostname() == "fullrt-advertiser" {
-						return hi.RoutableIPs().Len() > 0
-					}
-				}
-
-				return false
-			})
+		// The server stores the announcement before it answers.
+		require.NoError(t, c1.Direct().SendUpdate(ctx))
 
 		// Step 2: Approve the route on the server.
 		nodeID := findNodeID(t, srv, "fullrt-advertiser")
@@ -292,17 +239,20 @@ func TestRoutes(t *testing.T) {
 			10*time.Second, 100*time.Millisecond,
 			"r1 should be primary initially")
 
-		// 1. Take r1 offline. After the 10s grace period, r2 should take over.
+		// 1. Take r1 offline. After the 15s grace period, r2 should take over.
 		r1.Disconnect(t)
 		assert.Eventually(t, func() bool { return hasRoute(r2ID) && !hasRoute(r1ID) },
 			20*time.Second, 200*time.Millisecond,
 			"r2 should take over as primary after r1 offline")
 
-		// 2. Take r2 offline. With both routers gone, no primary should remain.
+		// 2. Take r2 offline. With both routers gone, r2 keeps the route.
 		r2.Disconnect(t)
-		assert.Eventually(t, func() bool { return !hasRoute(r1ID) && !hasRoute(r2ID) },
-			20*time.Second, 200*time.Millisecond,
-			"no primary should be assigned while both routers are offline")
+		assert.Eventually(t, func() bool {
+			nv, ok := srv.State().GetNodeByID(r2ID)
+
+			return ok && !nv.IsOnline().Get() && hasRoute(r2ID) && !hasRoute(r1ID)
+		}, 20*time.Second, 200*time.Millisecond,
+			"the last primary keeps the route while both routers are offline")
 
 		// 3. Reconnect r2 (cable plugged back in).
 		r2.Reconnect(t)
@@ -346,3 +296,332 @@ func TestRoutes(t *testing.T) {
 }
 
 // [findNodeID] is defined in issues_test.go.
+
+// routeOverlapCompatTests lists captures whose routers announce addresses
+// and prefixes of the tailnet's own range, approved by the policy's
+// autoApprovers (t1–t3), an admin key (t4) or a devices:routes token (t5).
+var routeOverlapCompatTests = []string{
+	"routes-t1-auto-v4-default",
+	"routes-t2-auto-v6-default",
+	"routes-t3-auto-narrow-keys",
+	"routes-t4-admin",
+	"routes-t5-oauth-routes-scope",
+}
+
+// routeOverlapSkipReasons lists checks where headscale differs from SaaS,
+// keyed <test_id>/<node>/<check>. A listed check that matches fails, so a fix
+// must delete its entry.
+var routeOverlapSkipReasons = map[string]string{}
+
+// routeOverlapNotCompared lists, by key prefix, checks left out: SaaS's
+// answer there is in doubt, so it is no reference.
+var routeOverlapNotCompared = []string{
+	"routes-t1-auto-v4-default/ovl-r-ctrl/peers",
+	"routes-t1-auto-v4-default/ovl-r-host4/peers",
+	"routes-t1-auto-v4-default/ovl-r-host6/peers",
+	"routes-t1-auto-v4-default/ovl-r-mapped/peers",
+	"routes-t1-auto-v4-default/ovl-r-narrow/peers",
+	"routes-t1-auto-v4-default/ovl-r-via/peers",
+	"routes-t1-auto-v4-default/ovl-r-wide-in/peers",
+	"routes-t2-auto-v6-default/ovl-r-ctrl/peers",
+	"routes-t2-auto-v6-default/ovl-r-host4/peers",
+	"routes-t2-auto-v6-default/ovl-r-host6/peers",
+	"routes-t2-auto-v6-default/ovl-r-mapped/peers",
+	"routes-t2-auto-v6-default/ovl-r-narrow/peers",
+	"routes-t2-auto-v6-default/ovl-r-via/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-ctrl/peer-routes",
+	"routes-t3-auto-narrow-keys/ovl-r-ctrl/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-host4/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-host6/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-mapped/peer-routes",
+	"routes-t3-auto-narrow-keys/ovl-r-mapped/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-narrow/peer-routes",
+	"routes-t3-auto-narrow-keys/ovl-r-narrow/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-via/peer-routes",
+	"routes-t3-auto-narrow-keys/ovl-r-via/peers",
+	"routes-t4-admin/ovl-r-ctrl/peer-routes",
+	"routes-t4-admin/ovl-r-ctrl/peers",
+	"routes-t4-admin/ovl-r-host4/peers",
+	"routes-t4-admin/ovl-r-host6/peers",
+	"routes-t4-admin/ovl-r-mapped/peer-routes",
+	"routes-t4-admin/ovl-r-mapped/peers",
+	"routes-t4-admin/ovl-r-narrow/peer-routes",
+	"routes-t4-admin/ovl-r-narrow/peers",
+	"routes-t4-admin/ovl-r-via/peer-routes",
+	"routes-t4-admin/ovl-r-via/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-ctrl/peer-routes",
+	"routes-t5-oauth-routes-scope/ovl-r-ctrl/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-host4/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-host6/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-mapped/peer-routes",
+	"routes-t5-oauth-routes-scope/ovl-r-mapped/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-narrow/peer-routes",
+	"routes-t5-oauth-routes-scope/ovl-r-narrow/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-via/peer-routes",
+	"routes-t5-oauth-routes-scope/ovl-r-via/peers",
+}
+
+// TestRoutesTailnetOverlapCompat replays routers whose routes overlap the
+// tailnet's addresses and compares approvals, served routes, peers and
+// filters with SaaS. Headscale must hand out SaaS's addresses, so a route
+// naming a node's address names the same node here and AllowedIPs compare
+// literally.
+//
+// Test data source: ../policy/v2/testdata/routes_results/, shared with
+// TestRoutesCompat* in policy/v2.
+func TestRoutesTailnetOverlapCompat(t *testing.T) {
+	t.Parallel()
+
+	for _, id := range routeOverlapCompatTests {
+		t.Run(id, func(t *testing.T) {
+			t.Parallel()
+
+			c, err := testcapture.Read(filepath.Join(
+				"..", "policy", "v2", "testdata", "routes_results", id+".hujson",
+			))
+			require.NoError(t, err)
+
+			srv, clients := startCaptureClients(t, c, routesSetByAPI(c))
+			names := slices.Sorted(maps.Keys(clients))
+
+			for _, name := range names {
+				want, got := c.Captures[name].Netmap.SelfNode, clients[name].Netmap().SelfNode
+				require.Equalf(t, prefixList(want.Addresses()), prefixList(got.Addresses()),
+					"%s: addresses differ from SaaS, so routes would name other nodes", name)
+			}
+
+			saasAddrs := saasAddrsByNode(c, clients)
+
+			// Each node's checks read only its own netmap and node, so the
+			// holds run at once.
+			var wg sync.WaitGroup
+
+			for _, name := range names {
+				wg.Go(func() {
+					t.Run(name, func(t *testing.T) {
+						key := id + "/" + name + "/"
+						want := c.Captures[name].Netmap
+						topo := c.Topology.Nodes[name]
+						nodeID := findNodeID(t, srv, name)
+
+						// Approvals and routes reach clients in batches; retry
+						// the comparisons until they hold.
+						requireNetmapHolds(t, func(t require.TestingT) {
+							nm := clients[name].Netmap()
+
+							if len(topo.RoutableIPs) > 0 {
+								node, ok := srv.State().GetNodeByID(nodeID)
+								require.True(t, ok)
+
+								overlapCheck(t, key+"approved",
+									sortedStrings(topo.ApprovedRoutes),
+									sortedStrings(util.PrefixesToString(node.ApprovedRoutes().AsSlice())))
+							}
+
+							wantPeers, gotPeers := peerRoutes(want, clients), peerRoutes(nm, clients)
+							overlapCheck(t, key+"peers",
+								strings.Join(slices.Sorted(maps.Keys(wantPeers)), "\n"),
+								strings.Join(slices.Sorted(maps.Keys(gotPeers)), "\n"))
+
+							// Peers on one side only are the peers check's; here
+							// only what both sides show is compared.
+							var wantRoutes, gotRoutes []string
+
+							for peer, routes := range wantPeers {
+								if got, ok := gotPeers[peer]; ok {
+									wantRoutes = append(wantRoutes, peer+": "+routes)
+									gotRoutes = append(gotRoutes, peer+": "+got)
+								}
+							}
+
+							overlapCheck(t, key+"peer-routes",
+								strings.Join(slices.Sorted(slices.Values(wantRoutes)), "\n"),
+								strings.Join(slices.Sorted(slices.Values(gotRoutes)), "\n"))
+
+							comparePacketFilter(t, nm, c.Captures[name], clients, saasAddrs,
+								key+"packet-filter", routeOverlapSkipReasons)
+
+							overlapCheck(t, key+"self-primary",
+								prefixList(want.SelfNode.PrimaryRoutes()), prefixList(nm.SelfNode.PrimaryRoutes()))
+							overlapCheck(t, key+"self-allowed",
+								selfAllowed(want.SelfNode), selfAllowed(nm.SelfNode))
+						})
+					})
+				})
+			}
+
+			wg.Wait()
+		})
+	}
+}
+
+// routesSetByAPI reports whether the capture's routes were approved through
+// the routes API rather than by the policy.
+func routesSetByAPI(c *testcapture.Capture) bool {
+	for _, step := range c.Steps {
+		for _, a := range step.Actions {
+			if a.Kind == "api" && a.Method == http.MethodPost &&
+				strings.HasSuffix(a.Path, "/routes") && a.Status == http.StatusOK {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// overlapCheck compares one rendering of a check, honouring
+// routeOverlapSkipReasons: a listed check must keep differing.
+func overlapCheck(t require.TestingT, key, want, got string) {
+	if notCompared(routeOverlapNotCompared, key) {
+		return
+	}
+
+	reason, listed := routeOverlapSkipReasons[key]
+
+	switch {
+	case listed && want == got:
+		t.Errorf("matches SaaS; delete routeOverlapSkipReasons[%q] (%s)", key, reason)
+	case !listed:
+		assert.Equalf(t, want, got, "%s", key)
+	}
+}
+
+// notCompared reports whether key falls under one of prefixes.
+func notCompared(prefixes []string, key string) bool {
+	return slices.ContainsFunc(prefixes, func(p string) bool {
+		return strings.HasPrefix(key, p)
+	})
+}
+
+// peerRoutes maps each peer in clients to its AllowedIPs and PrimaryRoutes.
+func peerRoutes(
+	nm *netmap.NetworkMap,
+	clients map[string]*servertest.TestClient,
+) map[string]string {
+	out := map[string]string{}
+
+	for _, p := range nm.Peers {
+		name := extractHostname(p.Name())
+		if hi := p.Hostinfo(); hi.Valid() && hi.Hostname() != "" {
+			name = hi.Hostname()
+		}
+
+		if _, ok := clients[name]; ok {
+			out[name] = "allowed " + prefixList(p.AllowedIPs()) + " primary " + prefixList(p.PrimaryRoutes())
+		}
+	}
+
+	return out
+}
+
+// selfAllowed is the node's AllowedIPs without its own addresses.
+func selfAllowed(self tailcfg.NodeView) string {
+	var out []netip.Prefix
+
+	for _, pfx := range self.AllowedIPs().All() {
+		if !views.SliceContains(self.Addresses(), pfx) {
+			out = append(out, pfx)
+		}
+	}
+
+	return prefixList(views.SliceOf(out))
+}
+
+func prefixList(pfxs views.Slice[netip.Prefix]) string {
+	return sortedStrings(util.PrefixesToString(pfxs.AsSlice()))
+}
+
+func sortedStrings(s []string) string {
+	return fmt.Sprint(slices.Sorted(slices.Values(s)))
+}
+
+// TestRoutesNodeRangeSingleNotServed checks that a router's approved single
+// addresses inside the node ranges, in either spelling, reach no viewer
+// through a plain grant or a via grant. They stay approved and in the
+// router's own AllowedIPs, never in its PrimaryRoutes, and its wider route
+// is still served.
+func TestRoutesNodeRangeSingleNotServed(t *testing.T) {
+	t.Parallel()
+
+	subnet := netip.MustParsePrefix("10.9.0.0/24")
+	singles := []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.50/32"),
+		netip.MustParsePrefix("fd7a:115c:a1e0::50/128"),
+		netip.MustParsePrefix("::ffff:100.64.0.50/128"),
+	}
+	routes := append([]netip.Prefix{subnet}, singles...)
+
+	for name, grant := range map[string]string{
+		"plain": `{"src": ["tag:client"], "dst": ["*"], "ip": ["*"]}`,
+		"via": `{"src": ["tag:client"], "ip": ["*"], "via": ["tag:router"],
+			"dst": ["10.9.0.0/24", "100.64.0.0/10", "fd7a:115c:a1e0::/48", "::ffff:0:0/96"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := servertest.NewServer(t)
+			user := srv.CreateUser(t, "routes-user")
+
+			changed, err := srv.State().SetPolicy([]byte(`{
+				"tagOwners": {"tag:client": ["routes-user@"], "tag:router": ["routes-user@"]},
+				"grants": [
+					{"src": ["tag:client"], "dst": ["tag:router"], "ip": ["*"]},
+					{"src": ["tag:router"], "dst": ["*"], "ip": ["*"]},
+					` + grant + `
+				]
+			}`))
+			require.NoError(t, err)
+
+			if changed {
+				changes, err := srv.State().ReloadPolicy()
+				require.NoError(t, err)
+				srv.App.Change(changes...)
+			}
+
+			router := servertest.NewClient(t, srv, "router",
+				servertest.WithUser(user), servertest.WithTags("tag:router"),
+				servertest.WithHostinfo(&tailcfg.Hostinfo{
+					BackendLogID: "servertest-router", Hostname: "router", RoutableIPs: routes,
+				}))
+			viewer := servertest.NewClient(t, srv, "viewer",
+				servertest.WithUser(user), servertest.WithTags("tag:client"))
+
+			viewer.WaitForPeers(t, 1, 15*time.Second)
+
+			routerID := findNodeID(t, srv, "router")
+			_, routeChange, err := srv.State().SetApprovedRoutes(routerID, routes)
+			require.NoError(t, err)
+			srv.App.Change(routeChange)
+
+			viewer.WaitForCondition(t, "viewer is served the subnet", 15*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					p, ok := viewer.PeerByName("router")
+
+					return ok && views.SliceContains(p.PrimaryRoutes(), subnet)
+				})
+			router.WaitForCondition(t, "router serves its subnet", 15*time.Second,
+				func(nm *netmap.NetworkMap) bool {
+					return views.SliceContains(nm.SelfNode.PrimaryRoutes(), subnet)
+				})
+
+			peer, _ := viewer.PeerByName("router")
+			self := router.Netmap().SelfNode
+
+			for _, single := range singles {
+				assert.Falsef(t, views.SliceContains(peer.AllowedIPs(), single),
+					"%s served in AllowedIPs", single)
+				assert.Falsef(t, views.SliceContains(peer.PrimaryRoutes(), single),
+					"%s served in PrimaryRoutes", single)
+				assert.Truef(t, views.SliceContains(self.AllowedIPs(), single),
+					"%s missing from the router's own AllowedIPs", single)
+				assert.Falsef(t, views.SliceContains(self.PrimaryRoutes(), single),
+					"%s in the router's own PrimaryRoutes", single)
+			}
+
+			node, ok := srv.State().GetNodeByID(routerID)
+			require.True(t, ok)
+			assert.ElementsMatch(t, routes, node.ApprovedRoutes().AsSlice())
+		})
+	}
+}

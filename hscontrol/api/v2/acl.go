@@ -1,18 +1,23 @@
 package apiv2
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/juanfont/headscale/hscontrol/scope"
+	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/tailscale/hujson"
 )
 
 func init() {
@@ -39,6 +44,21 @@ type getACLInput struct {
 	Tailnet string `path:"tailnet"`
 	Accept  string `header:"Accept"`
 	Details bool   `doc:"Accepted for compatibility; ignored." query:"details"`
+}
+
+type validateACLInput struct {
+	Tailnet string `path:"tailnet"`
+	RawBody []byte `contentType:"application/json"`
+}
+
+// validateACLOutput is the verdict on a policy. Tailscale answers a refused
+// policy with 200, its reason as message and, for failed tests, one data
+// entry per failing test.
+type validateACLOutput struct {
+	Body struct {
+		Message string         `json:"message,omitempty"`
+		Data    []apiErrorData `json:"data,omitempty"`
+	}
 }
 
 type setACLInput struct {
@@ -86,6 +106,10 @@ func registerACL(api huma.API, b Backend) {
 		// The body is an opaque HuJSON document captured raw; skip huma's
 		// schema validation (which would expect a base64 string).
 		SkipValidateBody: true,
+		// huma's own Body defaults, which it never applies to RawBody; also
+		// what v1 setPolicy accepts.
+		MaxBodyBytes:    1 << 20,
+		BodyReadTimeout: 5 * time.Second,
 		Errors: []int{
 			http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
 			http.StatusNotFound, http.StatusPreconditionFailed, http.StatusInternalServerError,
@@ -113,35 +137,67 @@ func registerACL(api huma.API, b Backend) {
 			}
 		}
 
-		// Mirror the v1 setPolicy flow: validate, SSH-check, persist, reload.
-		nodes := b.State.ListNodes()
-
-		_, err = b.State.SetPolicy(in.RawBody)
-		if err != nil {
-			return nil, huma.Error400BadRequest("setting policy", err)
-		}
-
-		if nodes.Len() > 0 {
-			_, err = b.State.SSHPolicy(nodes.At(0))
-			if err != nil {
-				return nil, huma.Error400BadRequest("verifying SSH rules", err)
-			}
-		}
-
-		updated, err := b.State.SetPolicyInDB(string(in.RawBody))
-		if err != nil {
-			return nil, huma.Error500InternalServerError("setting policy", err)
-		}
-
-		cs, err := b.State.ReloadPolicy()
+		updated, cs, err := b.State.UpdatePolicy(in.RawBody)
 		b.Change(cs...)
 
 		if err != nil {
-			return nil, huma.Error500InternalServerError("reloading policy", err)
+			return nil, mapError("setting policy", err)
 		}
 
-		return streamPolicy([]byte(updated.Data), aclContentType(in.Accept)), nil
+		return streamPolicy([]byte(updated.Data), aclWriteContentType(in.Accept)), nil
 	})
+
+	registerValidateACL(api, b, aclTags)
+}
+
+func registerValidateACL(api huma.API, b Backend, aclTags []string) {
+	huma.Register(api, requireScope(huma.Operation{
+		OperationID:      "validateACL",
+		Method:           http.MethodPost,
+		Path:             "/api/v2/tailnet/{tailnet}/acl/validate",
+		Summary:          "Validate a policy file",
+		Description:      "Checks a policy, its tests and its SSH rules without storing it. A refused policy answers 200 with the reason as message.",
+		Tags:             aclTags,
+		Security:         security,
+		DefaultStatus:    http.StatusOK,
+		SkipValidateBody: true,
+		// As setACL: huma applies no body limit to RawBody.
+		MaxBodyBytes:    1 << 20,
+		BodyReadTimeout: 5 * time.Second,
+		Errors: []int{
+			http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
+			http.StatusNotFound, http.StatusInternalServerError,
+		},
+	}, scope.PolicyFileRead), func(ctx context.Context, in *validateACLInput) (*validateACLOutput, error) {
+		err := requireDefaultTailnet(in.Tailnet)
+		if err != nil {
+			return nil, err
+		}
+
+		// As on Tailscale SaaS, only a body with no policy at all is a 400.
+		if len(bytes.TrimSpace(in.RawBody)) == 0 {
+			return nil, huma.Error400BadRequest("unexpected end of JSON input")
+		}
+
+		out := &validateACLOutput{}
+
+		err = b.State.ValidatePolicy(in.RawBody)
+		if errors.Is(err, state.ErrInvalidPolicy) {
+			out.Body.Message, out.Body.Data = policyRefusal(err)
+
+			return out, nil
+		}
+
+		if err != nil {
+			return nil, huma.Error500InternalServerError("validating policy", err)
+		}
+
+		return out, nil
+	})
+
+	// huma requires a RawBody; the handler answers an empty one as Tailscale
+	// does.
+	api.OpenAPI().Paths["/api/v2/tailnet/{tailnet}/acl/validate"].Post.RequestBody.Required = false
 }
 
 // currentPolicy returns the stored policy bytes, or the allow-all default when
@@ -181,19 +237,40 @@ func currentPolicy(b Backend) ([]byte, error) {
 	return nil, huma.Error500InternalServerError("unsupported policy mode", nil)
 }
 
-// streamPolicy writes the policy bytes as-is with the chosen content type and
-// a content-addressed ETag, bypassing huma's JSON marshaler so HuJSON survives.
+// streamPolicy writes the policy with the chosen content type and a
+// content-addressed ETag, bypassing huma's JSON marshaler so HuJSON survives. As
+// JSON, the policy loses its comments and trailing commas: a JSON reader cannot
+// parse them. The ETag stays over the stored bytes, so it holds for either read.
 func streamPolicy(data []byte, contentType string) *huma.StreamResponse {
 	return &huma.StreamResponse{Body: func(ctx huma.Context) {
+		body := data
+
+		if contentType == contentTypeJSON {
+			standard, err := hujson.Standardize(slices.Clone(data))
+			if err == nil {
+				body = standard
+			}
+		}
+
 		ctx.SetHeader("Content-Type", contentType)
 		ctx.SetHeader("ETag", policyETag(data))
 		ctx.SetStatus(http.StatusOK)
-		_, _ = ctx.BodyWriter().Write(data)
+		_, _ = ctx.BodyWriter().Write(body)
 	}}
 }
 
+// aclWriteContentType answers a policy write as HuJSON, as SaaS does, unless the
+// caller asks for JSON.
+func aclWriteContentType(accept string) string {
+	if strings.Contains(accept, contentTypeJSON) {
+		return contentTypeJSON
+	}
+
+	return contentTypeHuJSON
+}
+
 // aclContentType serves HuJSON only when explicitly asked; everything else
-// (including an empty Accept) gets application/json. The bytes are identical.
+// (including an empty Accept) gets application/json.
 func aclContentType(accept string) string {
 	if strings.Contains(accept, contentTypeHuJSON) {
 		return contentTypeHuJSON

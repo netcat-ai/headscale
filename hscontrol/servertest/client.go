@@ -3,18 +3,22 @@ package servertest
 import (
 	"context"
 	"fmt"
+	"path"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/views"
@@ -35,6 +39,22 @@ type TestClient struct {
 	authKey string
 	user    *types.User
 
+	// machineKey survives every login and discoKey every login but
+	// [TestClient.Restart], as with tailscaled.
+	machineKey key.MachinePrivate
+	discoKey   key.DiscoPublic
+	logf       logger.Logf
+
+	// approve completes an interactive login; see [WithInteractiveLogin].
+	approve func(authID string) error
+
+	// loginFlags and endpoints: see [WithLoginFlags] and [WithEndpoints].
+	loginFlags controlclient.LoginFlags
+	endpoints  []tailcfg.Endpoint
+
+	// stopFollowup ends the follow-up [TestClient.RotateDisco] left waiting.
+	stopFollowup context.CancelFunc
+
 	// Connection lifecycle.
 	pollCtx    context.Context //nolint:containedctx // test-only; context stored for cancel control
 	pollCancel context.CancelFunc
@@ -47,9 +67,21 @@ type TestClient struct {
 	updatesReceived int
 	noHistory       bool
 
-	// deltaUpdates and deltaRemoved: see [WithDeltaUpdates].
+	// streams and streamMaps: see [TestClient.Stream].
+	streams, streamMaps int
+
+	// deltaUpdates, deltaRemoved and deltaSeen: see [WithDeltaUpdates].
 	deltaUpdates bool
 	deltaRemoved []tailcfg.NodeID
+	deltaSeen    []time.Time
+
+	// registers: see [TestClient.RegisterAttempts].
+	registers []testcapture.RegisterAttempt
+
+	// frames: see [TestClient.Frames]. stamped is set while the response
+	// in hand carried a ControlTime, so its rebuild is already counted.
+	frames  int
+	stamped bool
 
 	// updates is a buffered channel that receives a signal
 	// each time a new [netmap.NetworkMap] arrives.
@@ -68,8 +100,13 @@ type clientConfig struct {
 	hostname     string
 	tags         []string
 	user         *types.User
+	authKey      string
 	deltaUpdates bool
 	noHistory    bool
+	hostinfo     *tailcfg.Hostinfo
+	approve      func(authID string) error
+	loginFlags   controlclient.LoginFlags
+	endpoints    []tailcfg.Endpoint
 }
 
 // WithoutNetmapHistory retains only the latest netmap and one queued update.
@@ -102,6 +139,37 @@ func WithTags(tags ...string) ClientOption {
 	return func(c *clientConfig) { c.tags = tags }
 }
 
+// WithAuthKey registers with key instead of a key minted for the client.
+func WithAuthKey(key string) ClientOption {
+	return func(c *clientConfig) { c.authKey = key }
+}
+
+// WithHostinfo registers with hi instead of a Hostinfo holding only the
+// client's name, so a client can request tags or announce routes at
+// registration.
+func WithHostinfo(hi *tailcfg.Hostinfo) ClientOption {
+	return func(c *clientConfig) { c.hostinfo = hi }
+}
+
+// WithInteractiveLogin registers without an auth key, as `tailscale up`
+// does: the server answers with an auth URL and approve, given its auth ID,
+// completes the login, as `headscale auth register` would.
+func WithInteractiveLogin(approve func(authID string) error) ClientOption {
+	return func(c *clientConfig) { c.approve = approve }
+}
+
+// WithLoginFlags adds flags to every login, as tailscaled adds
+// [controlclient.LoginEphemeral] when it runs with --state=mem:.
+func WithLoginFlags(flags controlclient.LoginFlags) ClientOption {
+	return func(c *clientConfig) { c.loginFlags = flags }
+}
+
+// WithEndpoints makes the client report eps in its map requests, as
+// tailscaled does once it has found its paths.
+func WithEndpoints(eps ...tailcfg.Endpoint) ClientOption {
+	return func(c *clientConfig) { c.endpoints = eps }
+}
+
 // WithUser sets the user for the client. If not set, the harness
 // creates a default user.
 func WithUser(user *types.User) ClientOption {
@@ -111,6 +179,20 @@ func WithUser(user *types.User) ClientOption {
 // NewClient creates a [TestClient], registers it with the [TestServer]
 // using a pre-auth key, and starts long-polling for map updates.
 func NewClient(tb testing.TB, server *TestServer, name string, opts ...ClientOption) *TestClient {
+	tb.Helper()
+
+	tc, err := TryNewClient(tb, server, name, opts...)
+	if err != nil {
+		tb.Fatalf("servertest: NewClient(%s): %v", name, err)
+	}
+
+	return tc
+}
+
+// TryNewClient is [NewClient] for a registration that may be refused: it
+// returns the login error, and a client that holds no node and does not
+// poll.
+func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...ClientOption) (*TestClient, error) {
 	tb.Helper()
 
 	cc := &clientConfig{
@@ -133,6 +215,10 @@ func NewClient(tb testing.TB, server *TestServer, name string, opts ...ClientOpt
 	var authKey string
 
 	switch {
+	case cc.approve != nil:
+		// Interactive: no key.
+	case cc.authKey != "":
+		authKey = cc.authKey
 	case cc.ephemeral:
 		authKey = server.CreateEphemeralPreAuthKey(tb, uid)
 	case len(cc.tags) > 0:
@@ -151,58 +237,101 @@ func NewClient(tb testing.TB, server *TestServer, name string, opts ...ClientOpt
 	// so that no real TCP sockets are used.
 	dialer.SetSystemDialerForTest(server.MemNet().Dial)
 
-	machineKey := key.NewMachine()
-
-	direct, err := controlclient.NewDirect(controlclient.Options{
-		Persist:              persist.Persist{},
-		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return machineKey, nil },
-		ServerURL:            server.URL,
-		AuthKey:              authKey,
-		Hostinfo: &tailcfg.Hostinfo{
-			BackendLogID: "servertest-" + name,
-			Hostname:     cc.hostname,
-		},
-		DiscoPublicKey: key.NewDisco().Public(),
-		Logf:           tb.Logf,
-		HealthTracker:  tracker,
-		Dialer:         dialer,
-		Bus:            bus,
-	})
-	if err != nil {
-		tb.Fatalf("servertest: NewDirect(%s): %v", name, err)
-	}
-
 	updateBuffer := 64
 	if cc.noHistory {
 		updateBuffer = 1
 	}
 
 	tc := &TestClient{
-		Name:    name,
-		server:  server,
-		direct:  direct,
-		authKey: authKey,
-		user:    user,
-		updates: make(chan *netmap.NetworkMap, updateBuffer),
-		bus:     bus,
-		dialer:  dialer,
-		tracker: tracker,
+		Name:       name,
+		server:     server,
+		authKey:    authKey,
+		user:       user,
+		machineKey: key.NewMachine(),
+		discoKey:   key.NewDisco().Public(),
+		approve:    cc.approve,
+		loginFlags: cc.loginFlags,
+		endpoints:  cc.endpoints,
+		updates:    make(chan *netmap.NetworkMap, updateBuffer),
+		bus:        bus,
+		dialer:     dialer,
+		tracker:    tracker,
 
 		deltaUpdates: cc.deltaUpdates,
 		noHistory:    cc.noHistory,
 	}
 
+	tc.logf = func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		tb.Logf("%s", line)
+
+		tc.mu.Lock()
+		tc.registers, _ = testcapture.AppendRegisterLine(tc.registers, line)
+
+		// The poll logs a response's ControlTime before it applies it.
+		if strings.Contains(line, `{"controltime":`) {
+			tc.frames++
+			tc.stamped = true
+		}
+		tc.mu.Unlock()
+	}
+
+	hi := cc.hostinfo
+	if hi == nil {
+		hi = &tailcfg.Hostinfo{
+			BackendLogID: "servertest-" + name,
+			Hostname:     cc.hostname,
+		}
+	}
+
+	direct, err := tc.newDirect(persist.Persist{}, authKey, hi)
+	if err != nil {
+		tb.Fatalf("servertest: NewDirect(%s): %v", name, err)
+	}
+
+	tc.direct = direct
+
 	tb.Cleanup(func() {
 		tc.cleanup()
 	})
 
-	// Register with the server.
-	tc.register(tb)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = tc.tryLogin(ctx, controlclient.LoginDefault, tc.approve)
+	if err != nil {
+		return tc, err
+	}
 
 	// Start long-polling in the background.
 	tc.startPoll(tb)
 
-	return tc
+	return tc, nil
+}
+
+// newDirect builds a [controlclient.Direct] for the client's machine.
+func (c *TestClient) newDirect(
+	p persist.Persist,
+	authKey string,
+	hi *tailcfg.Hostinfo,
+) (*controlclient.Direct, error) {
+	direct, err := controlclient.NewDirect(controlclient.Options{
+		Persist:              p,
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) { return c.machineKey, nil },
+		ServerURL:            c.server.URL,
+		AuthKey:              authKey,
+		Hostinfo:             hi,
+		DiscoPublicKey:       c.discoKey,
+		Logf:                 c.logf,
+		HealthTracker:        c.tracker,
+		Dialer:               c.dialer,
+		Bus:                  c.bus,
+	})
+	if err == nil && len(c.endpoints) > 0 {
+		direct.SetEndpoints(c.endpoints)
+	}
+
+	return direct, err
 }
 
 // register performs the initial [controlclient.Direct.TryLogin] to register the client.
@@ -212,14 +341,64 @@ func (c *TestClient) register(tb testing.TB) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	url, err := c.direct.TryLogin(ctx, controlclient.LoginDefault)
+	err := c.tryLogin(ctx, controlclient.LoginDefault, c.approve)
 	if err != nil {
 		tb.Fatalf("servertest: TryLogin(%s): %v", c.Name, err)
 	}
+}
 
-	if url != "" {
-		tb.Fatalf("servertest: TryLogin(%s): unexpected auth URL: %s (expected auto-auth with preauth key)", c.Name, url)
+// tryLogin logs the current Direct in. An auth URL is completed through
+// approve, and is an error without it. A failed login is recorded in
+// [TestClient.RegisterAttempts], as tailscaled logs it.
+func (c *TestClient) tryLogin(ctx context.Context, flags controlclient.LoginFlags, approve func(string) error) error {
+	url, err := c.direct.TryLogin(ctx, flags|c.loginFlags)
+
+	switch {
+	case err != nil:
+	case url != "" && approve != nil:
+		err = c.waitLogin(ctx, url, approve)
+	case url != "":
+		err = fmt.Errorf("unexpected auth URL %q (expected auto-auth with preauth key)", url) //nolint:err113
 	}
+
+	if err != nil {
+		c.mu.Lock()
+		c.registers = append(c.registers, testcapture.RegisterAttempt{Err: err.Error()})
+		c.mu.Unlock()
+	}
+
+	return err
+}
+
+// waitLogin waits on the auth URL while approve completes the login it names.
+func (c *TestClient) waitLogin(ctx context.Context, url string, approve func(string) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := c.direct.WaitLoginURL(ctx, url)
+		done <- err
+	}()
+
+	// The URL ends in the auth ID: /register/<id>.
+	err := approve(path.Base(url))
+	if err != nil {
+		return err
+	}
+
+	return <-done
+}
+
+// RegisterAttempts returns the client's /machine/register exchanges as
+// tailscaled logs them, with each failed login as its own entry; see
+// [testcapture.AppendRegisterLine]. Node keys are short forms, not labels.
+func (c *TestClient) RegisterAttempts() []testcapture.RegisterAttempt {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return slices.Clone(c.registers)
 }
 
 // startPoll begins the long-poll [tailcfg.MapRequest] loop.
@@ -235,6 +414,12 @@ func (c *TestClient) startPoll(tb testing.TB) {
 func (c *TestClient) startPollLoop() {
 	c.pollCtx, c.pollCancel = context.WithCancel(context.Background())
 	c.pollDone = make(chan struct{})
+
+	c.mu.Lock()
+	c.streams++
+	c.streamMaps = 0
+	c.stamped = false
+	c.mu.Unlock()
 
 	go func() {
 		defer close(c.pollDone)
@@ -271,10 +456,21 @@ func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	c.mu.Lock()
 	c.netmap = nm
 	c.updatesReceived++
+	c.streamMaps++
 
 	if !c.noHistory {
 		c.history = append(c.history, nm)
 	}
+
+	// Removals sent ahead of their batch and a deleted node's expiry carry
+	// no ControlTime, so a rebuild with none before it is a response too.
+	// shortcut: one right after a response a delta client applied in place
+	// goes uncounted; count at the decoder if headscale sends one alone.
+	if !c.stamped {
+		c.frames++
+	}
+
+	c.stamped = false
 	c.mu.Unlock()
 
 	// Non-blocking send to the updates channel.
@@ -287,8 +483,8 @@ func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 // deltaRecorder is the [controlclient.NetmapUpdater] of a [WithDeltaUpdates]
 // client. Like tailscaled it takes packet filter and user profile updates
 // narrowly, which lets [controlclient.Direct] try the delta path. It
-// records removals and declines the mutations, so the full netmap is
-// still delivered and the client's peer state stays exact.
+// records removals and last seen times and declines the mutations, so the
+// full netmap is still delivered and the client's peer state stays exact.
 type deltaRecorder struct{ *TestClient }
 
 func (d deltaRecorder) UpdatePacketFilter(views.Slice[tailcfg.FilterRule], []filter.Match) bool {
@@ -304,12 +500,24 @@ func (d deltaRecorder) UpdateNetmapDelta(muts []netmap.NodeMutation) bool {
 	defer d.mu.Unlock()
 
 	for _, m := range muts {
-		if _, ok := m.(netmap.NodeMutationRemove); ok {
+		switch m := m.(type) {
+		case netmap.NodeMutationRemove:
 			d.deltaRemoved = append(d.deltaRemoved, m.NodeIDBeingMutated())
+		case netmap.NodeMutationLastSeen:
+			d.deltaSeen = append(d.deltaSeen, m.LastSeen)
 		}
 	}
 
 	return false
+}
+
+// DeltaLastSeen returns the last seen times that arrived in a response the
+// client could apply incrementally; see [WithDeltaUpdates].
+func (c *TestClient) DeltaLastSeen() []time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return slices.Clone(c.deltaSeen)
 }
 
 // DeltaRemovedPeers returns the peers whose removal arrived in a response
@@ -323,6 +531,10 @@ func (c *TestClient) DeltaRemovedPeers() []tailcfg.NodeID {
 
 // cleanup releases all resources.
 func (c *TestClient) cleanup() {
+	if c.stopFollowup != nil {
+		c.stopFollowup()
+	}
+
 	if c.pollCancel != nil {
 		c.pollCancel()
 	}
@@ -437,6 +649,146 @@ func (c *TestClient) ReloginAndPoll(ctx context.Context) error {
 	c.startPollLoop()
 
 	return nil
+}
+
+// Relogin logs the client in again with authKey, as tailscaled does for
+// `tailscale up --auth-key` (force: `--force-reauth`): see [TestClient.Login],
+// with the current login. The first request presents the current node key
+// unless force rotates it. hi replaces the Hostinfo, so routes can be
+// restated.
+//
+// Safe to call from non-test goroutines.
+func (c *TestClient) Relogin(ctx context.Context, authKey string, force bool, hi *tailcfg.Hostinfo) error {
+	flags := controlclient.LoginDefault
+	if force {
+		flags = controlclient.LoginInteractive
+	}
+
+	return c.Login(ctx, c.Persist(), authKey, flags, hi, nil)
+}
+
+// Login logs the machine in from p, as LocalBackend.Start does: a new
+// [controlclient.Direct] keeps the machine key and presents p's node key,
+// unless flags ask for a new one. p is the current login ([TestClient.Persist])
+// for a relogin or restart, another profile's for a profile switch, and
+// empty for a new profile. With approve set and no authKey the login is
+// interactive, see [WithInteractiveLogin]. The poll restarts once the login
+// succeeds; after a failed one the client does not poll.
+//
+// Safe to call from non-test goroutines.
+func (c *TestClient) Login(
+	ctx context.Context,
+	p persist.Persist,
+	authKey string,
+	flags controlclient.LoginFlags,
+	hi *tailcfg.Hostinfo,
+	approve func(authID string) error,
+) error {
+	if c.stopFollowup != nil {
+		c.stopFollowup()
+	}
+
+	if c.pollCancel != nil {
+		c.pollCancel()
+
+		select {
+		case <-c.pollDone:
+		case <-ctx.Done():
+			return fmt.Errorf("servertest: Login(%s): poll did not exit: %w", c.Name, ctx.Err())
+		}
+	}
+
+	direct, err := c.newDirect(p, authKey, hi)
+	if err != nil {
+		return fmt.Errorf("servertest: Login(%s): NewDirect: %w", c.Name, err)
+	}
+
+	c.direct.Close()
+	c.direct = direct
+	c.authKey = authKey
+
+	err = c.tryLogin(ctx, flags, approve)
+	if err != nil {
+		return fmt.Errorf("servertest: Login(%s): %w", c.Name, err)
+	}
+
+	c.resetNetmapState()
+	c.startPollLoop()
+
+	return nil
+}
+
+// Restart logs the machine in again with a new disco key and no auth key,
+// as a restarted tailscaled does: its login is kept, its disco key is not.
+//
+// Safe to call from non-test goroutines.
+func (c *TestClient) Restart(ctx context.Context, hi *tailcfg.Hostinfo) error {
+	c.discoKey = key.NewDisco().Public()
+
+	return c.Login(ctx, c.Persist(), "", controlclient.LoginDefault, hi, nil)
+}
+
+// RotateDisco gives the client a new disco key and reports it, then logs in
+// again and restarts the map poll on the same [controlclient.Direct], as
+// `tailscale debug rotate-disco-key` does by restarting the backend. An auth
+// URL is not approved: its follow-up waits, as tailscaled's does, while the
+// poll goes on under the current node key.
+//
+// Safe to call from non-test goroutines.
+func (c *TestClient) RotateDisco(ctx context.Context) error {
+	c.discoKey = key.NewDisco().Public()
+	c.direct.SetDiscoPublicKey(c.discoKey)
+
+	err := c.direct.SendUpdate(ctx)
+	if err != nil {
+		return fmt.Errorf("servertest: RotateDisco(%s): %w", c.Name, err)
+	}
+
+	url, err := c.direct.TryLogin(ctx, controlclient.LoginDefault|c.loginFlags)
+	if err != nil {
+		return fmt.Errorf("servertest: RotateDisco(%s): %w", c.Name, err)
+	}
+
+	if url != "" {
+		if c.stopFollowup != nil {
+			c.stopFollowup()
+		}
+
+		// The follow-up outlives this call, as tailscaled's outlives the CLI.
+		var fctx context.Context
+
+		fctx, c.stopFollowup = context.WithCancel(context.WithoutCancel(ctx))
+		direct := c.direct
+
+		go func() { _, _ = direct.WaitLoginURL(fctx, url) }()
+	}
+
+	return c.RestartPoll(ctx)
+}
+
+// SetExpirySooner asks the server to expire the node's key at expiry, as
+// `tailscale debug set-expire` does. A refusal is recorded in
+// [TestClient.RegisterAttempts], as a failed login is.
+//
+// Safe to call from non-test goroutines.
+func (c *TestClient) SetExpirySooner(ctx context.Context, expiry time.Time) error {
+	err := c.direct.SetExpirySooner(ctx, expiry)
+	if err != nil {
+		c.mu.Lock()
+		c.registers = append(c.registers, testcapture.RegisterAttempt{Err: err.Error()})
+		c.mu.Unlock()
+	}
+
+	return err
+}
+
+// Persist returns the client's current login: its node keys and user.
+func (c *TestClient) Persist() persist.Persist {
+	if v := c.direct.GetPersist(); v.Valid() {
+		return *v.AsStruct()
+	}
+
+	return persist.Persist{}
 }
 
 // RestartPoll tears down the current long-poll session and immediately
@@ -603,6 +955,27 @@ func (c *TestClient) UpdateCount() int {
 	return c.updatesReceived
 }
 
+// Frames returns how many map responses other than keep-alives the client
+// has been sent: each one with a ControlTime, and each netmap rebuild from
+// one without. Unlike [TestClient.UpdateCount] it also counts responses that
+// a [WithDeltaUpdates] client applies without rebuilding its netmap.
+func (c *TestClient) Frames() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.frames
+}
+
+// Stream returns how many map streams the client has opened, then how many
+// netmaps the current one delivered. [TestClient.Netmap] outlives a stream,
+// so only this tells a new stream that was answered from one that was not.
+func (c *TestClient) Stream() (int, int) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.streams, c.streamMaps
+}
+
 // History returns the retained [netmap.NetworkMap] snapshots in order.
 // It is empty when [WithoutNetmapHistory] is set.
 func (c *TestClient) History() []*netmap.NetworkMap {
@@ -652,6 +1025,12 @@ func (c *TestClient) WaitForCondition(tb testing.TB, desc string, timeout time.D
 			tb.Fatalf("servertest: WaitForCondition(%s, %q): timeout after %v", c.Name, desc, timeout)
 		}
 	}
+}
+
+// MachineKey is the client's machine key, which identifies its nodes across
+// logins.
+func (c *TestClient) MachineKey() key.MachinePublic {
+	return c.machineKey.Public()
 }
 
 // Direct returns the underlying [controlclient.Direct] for

@@ -66,19 +66,10 @@ func PeerCapMap(peer types.NodeView, peerSelfCaps tailcfg.NodeCapMap) tailcfg.No
 var unmodelledTailnetStateCaps = []nodecap.Cap{
 	// --- 1. User-role gated ---
 
-	// [tailcfg.CapabilityAdmin]: the hosted control plane stamps this
-	// on nodes whose owning user has the admin role; tagged nodes
-	// inherit from a tagOwner with the role. Headscale has no
-	// user-role model — [types.Node.TailNode] emits it as part of
-	// the always-on baseline. Stripping on both sides keeps the diff
-	// from failing on every user-owned non-admin node in a capture.
-	// Long-term fix is autogroup:admin support.
-	nodecap.Admin,
-
-	// [tailcfg.CapabilityOwner]: same shape as is-admin, conditional
-	// on the "owner" role rather than admin. Headscale does not emit
-	// this cap at all. autogroup:owner support is tracked under
-	// NO_USER_ROLES — see the compat skip list.
+	// [tailcfg.CapabilityOwner]: conditional on the "owner" role, which
+	// headscale does not model, so it does not emit this cap at all.
+	// autogroup:owner support is tracked under NO_USER_ROLES — see the
+	// compat skip list.
 	nodecap.Owner,
 
 	// --- 2. Feature not implemented ---
@@ -137,15 +128,13 @@ var unmodelledTailnetStateCaps = []nodecap.Cap{
 	// [tailscale.com/control/controlknobs.Knobs.UpdateFromNodeAttributes].
 	nodecap.ProbeUDPLifetime,
 
-	// [tailcfg.NodeAttrSSHBehaviorV1]: configures the embedded SSH
-	// server (no su, in-process SFTP). Internal tuning; the embedded
-	// server picks Tailscale-vendored defaults without the cap.
+	// [tailcfg.NodeAttrSSHBehaviorV1]: picks the embedded SSH server's
+	// older path on a root-run Linux daemon: no su, in-process SFTP, no
+	// PAM session or login environment. SaaS stamps it on every node;
+	// headscale leaves it to a nodeAttr on purpose, as switching changes
+	// existing users' login environment. It is more than tuning, so
+	// TestSSHBehaviorIsAnAdminChoice pins it apart from this strip.
 	nodecap.SSHBehaviorV1,
-
-	// [tailcfg.NodeAttrSSHEnvironmentVariables]: gates SendEnv
-	// forwarding in the embedded SSH server. Internal; default chosen
-	// by the server.
-	nodecap.SSHEnvironmentVariables,
 }
 
 // strippedCapPrefixes lists URL/string prefixes for parameterized or

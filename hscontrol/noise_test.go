@@ -10,9 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,10 +32,133 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/control/ts2021"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/netutil"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/util/zstdframe"
 )
+
+var privateDiagnosticPaths = []string{
+	"/metrics",
+	"/debug/",
+	"/debug/vars",
+	"/debug/varz",
+	"/debug/pprof/",
+	"/debug/pprof/goroutine",
+	"/debug/statsviz/",
+	"/debug/statsviz/ws",
+	"/debug/overview",
+	"/debug/config",
+	"/debug/policy",
+	"/debug/filter",
+	"/debug/ssh",
+	"/debug/derp",
+	"/debug/nodestore",
+	"/debug/registration-cache",
+	"/debug/routes",
+	"/debug/policy-manager",
+	"/debug/mapresponses",
+	"/debug/batcher",
+	"/debug/ping",
+}
+
+// TestNoiseRouter_DoesNotExposeAdministrativeEndpoints covers https://github.com/juanfont/headscale/issues/3571.
+func TestNoiseRouter_DoesNotExposeAdministrativeEndpoints(t *testing.T) {
+	t.Parallel()
+
+	for _, metricsAddr := range []string{"", "127.0.0.1:9090"} {
+		t.Run("metrics_addr="+metricsAddr, func(t *testing.T) {
+			t.Parallel()
+
+			serverKey := key.NewMachine()
+			app := &Headscale{
+				cfg:             &types.Config{MetricsAddr: metricsAddr},
+				noisePrivateKey: &serverKey,
+			}
+			server := httptest.NewServer(http.HandlerFunc(app.NoiseUpgradeHandler))
+			t.Cleanup(server.Close)
+
+			dialer := tsdial.NewDialer(netmon.NewStatic())
+
+			t.Cleanup(func() { assert.NoError(t, dialer.Close()) })
+
+			// A fresh machine key has no registered node or credentials.
+			client, err := ts2021.NewClient(ts2021.ClientOpts{
+				ServerURL:    server.URL,
+				PrivKey:      key.NewMachine(),
+				ServerPubKey: serverKey.Public(),
+				Dialer:       dialer,
+				Logf:         t.Logf,
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, client.Close()) })
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+
+			resp, err := client.DoWithBody(ctx, http.MethodGet, "/machine/whoami", key.NodePublic{}, nil)
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusNotImplemented, resp.StatusCode,
+				"the Noise protocol router must remain reachable before registration")
+			require.NoError(t, resp.Body.Close())
+
+			paths := slices.Concat(privateDiagnosticPaths, []string{
+				"/api/v1/node",
+				"/api/v1/apikey",
+				"/api/v1/debug/node",
+				"/api/v1/openapi.yaml",
+				"/api/v2/tailnet/-/settings",
+				"/api/v2/tailnet/-/keys",
+				"/api/v2/docs",
+			})
+			for _, path := range paths {
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					t.Run(method+" "+path, func(t *testing.T) {
+						resp, err := client.DoWithBody(ctx, method, path, key.NodePublic{}, nil)
+						require.NoError(t, err)
+
+						defer resp.Body.Close()
+
+						assert.Equal(t, 2, resp.ProtoMajor)
+						assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+							"administrative endpoints must not be mounted on Noise")
+					})
+				}
+			}
+		})
+	}
+}
+
+func TestMetricsRouterIsolation(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	public := app.HTTPHandler()
+
+	for _, path := range privateDiagnosticPaths {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			public.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusNotFound, rec.Code,
+				"diagnostic endpoints must not be mounted on the public router")
+		})
+	}
+
+	private := app.debugHTTPServer().Handler
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	private.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "# HELP")
+}
 
 // newNoiseRouterWithBodyLimit builds a chi router with the same body-limit
 // middleware used in the real Noise router but wired to a test handler that
@@ -230,6 +356,69 @@ func serveRegister(t *testing.T, ns *noiseServer, body any) *httptest.ResponseRe
 	})
 
 	return rec
+}
+
+func TestRegistrationHandler_AdmissionRetry(t *testing.T) {
+	app := createTestApp(t, func(cfg *types.Config) {
+		cfg.Tuning.RegisterCacheMaxEntries = 1
+	})
+	defer func() { require.NoError(t, app.state.Close()) }()
+
+	require.NoError(t, app.state.SetAuthCacheEntry(types.MustAuthID(), types.NewAuthRequest()))
+
+	ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+	rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+		Version:  capver.MinSupportedCapabilityVersion,
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: "node"},
+	})
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.NotEmpty(t, rec.Header().Get("Retry-After"))
+
+	var response tailcfg.RegisterResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.Empty(t, response.AuthURL)
+	require.NotEmpty(t, response.Error)
+}
+
+func TestRegistrationHandler_RegistrationPayloadLimit(t *testing.T) {
+	app := createTestApp(t)
+	defer func() { require.NoError(t, app.state.Close()) }()
+
+	hostinfo := &tailcfg.Hostinfo{Hostname: "node", OS: strings.Repeat("x", types.MaxHostinfoSize-128)}
+	require.NoError(t, types.ValidateHostinfo(hostinfo), "the full registration must reach cache admission")
+
+	ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+	rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+		Version:  capver.MinSupportedCapabilityVersion,
+		NodeKey:  key.NewNode().Public(),
+		Hostinfo: hostinfo,
+	})
+	require.Equal(t, http.StatusOK, rec.Code, "controlclient only surfaces RegisterResponse.Error with HTTP 200")
+	require.Empty(t, rec.Header().Get("Retry-After"))
+
+	var response tailcfg.RegisterResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+	require.Contains(t, response.Error, types.ErrRegistrationPayloadTooLarge.Error())
+	require.Contains(t, response.Error, strconv.Itoa(types.MaxRegistrationPayloadBytes))
+	require.Empty(t, response.AuthURL)
+	require.False(t, response.MachineAuthorized)
+	require.Zero(t, app.state.DebugRegistrationCache()["current_len"], "oversized registrations must not enter the auth cache")
+}
+
+func TestSSHActionFollowUp_ReleasesConsumedSession(t *testing.T) {
+	f := newSSHVerdictFixture(t)
+	authID, auth := f.mint(t)
+	auth.FinishAuth(types.AuthVerdict{})
+
+	_, ok := f.ns.headscale.state.GetAuthCacheEntry(authID)
+	require.True(t, ok, "approval must remain available until the client consumes it")
+
+	action := sshActionFromRecorder(t, f.followUp(t, authID))
+	require.True(t, action.Accept)
+
+	_, ok = f.ns.headscale.state.GetAuthCacheEntry(authID)
+	require.False(t, ok, "a consumed verdict must release its admission slot")
 }
 
 func requireBelowFloorRejected(t *testing.T, rec *httptest.ResponseRecorder) {
@@ -595,10 +784,10 @@ func TestSSHActionFollowUp_RejectsBindingMismatch(t *testing.T) {
 
 	// Mint an SSH-check auth request bound to (srcCached, dstCached).
 	authID := types.MustAuthID()
-	app.state.SetAuthCacheEntry(
+	require.NoError(t, app.state.SetAuthCacheEntry(
 		authID,
 		types.NewSSHCheckAuthRequest(srcCached.ID, dstCached.ID),
-	)
+	))
 
 	// Build a follow-up that claims to be for (srcOther, dstOther) but
 	// reuses the bound auth_id. The Noise machineKey matches dstOther so
@@ -755,7 +944,7 @@ func TestSSHActionFollowUp_RejectsVerdictAfterCheckRemoved(t *testing.T) {
 			require.NoError(t, err)
 
 			authID := types.MustAuthID()
-			app.state.SetAuthCacheEntry(authID, types.NewSSHCheckAuthRequest(src.ID, dst.ID))
+			require.NoError(t, app.state.SetAuthCacheEntry(authID, types.NewSSHCheckAuthRequest(src.ID, dst.ID)))
 
 			auth, ok := app.state.GetAuthCacheEntry(authID)
 			require.True(t, ok)
@@ -1672,4 +1861,521 @@ func TestSetDNSHandlerDisabled(t *testing.T) {
 		Value:   challengeValue("laptop"),
 	})
 	assert.Equal(t, http.StatusNotImplemented, rec.Code)
+}
+
+func manyServices(n int) []tailcfg.Service {
+	services := make([]tailcfg.Service, n)
+	for i := range services {
+		services[i] = tailcfg.Service{Proto: tailcfg.TCP, Port: uint16(i)}
+	}
+
+	return services
+}
+
+func TestPollNetMapHandler_AcceptsClientReport(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("report-map-user")
+	node := putTestNodeInStore(t, app, user, "report-map-node")
+
+	endpoints := make([]netip.AddrPort, types.MaxEndpoints+1)
+	for i := range endpoints {
+		endpoints[i] = netip.AddrPortFrom(netip.MustParseAddr("192.0.2.1"), uint16(i))
+	}
+
+	report := tailcfg.MapRequest{
+		Version:       tailcfg.CurrentCapabilityVersion,
+		NodeKey:       node.NodeKey,
+		DiscoKey:      node.DiscoKey,
+		OmitPeers:     true,
+		Endpoints:     endpoints,
+		EndpointTypes: make([]tailcfg.EndpointType, types.MaxEndpoints+1),
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname:    "report-map-node",
+			Services:    manyServices(300),
+			NetInfo:     &tailcfg.NetInfo{PreferredDERP: 1, DERPLatency: map[string]float64{"1-v4": 0.01}},
+			RoutableIPs: slices.Repeat([]netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, types.MaxRoutableIPs+1),
+		},
+	}
+
+	ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+	rec := httptest.NewRecorder()
+	ns.PollNetMapHandler(rec, newMapRequest(t, report))
+	require.Equal(t, http.StatusOK, rec.Code, "body=%q", rec.Body.String())
+
+	stored, ok := app.state.GetNodeByID(node.ID)
+	require.True(t, ok)
+	assert.Equal(t, report.Hostinfo.Hostname, stored.Hostname())
+	report.Endpoints = report.Endpoints[:types.MaxEndpoints]
+	report.EndpointTypes = report.EndpointTypes[:types.MaxEndpoints]
+	report.Hostinfo.RoutableIPs = report.Hostinfo.RoutableIPs[:types.MaxRoutableIPs]
+	report.Hostinfo.NetInfo.DERPLatency = nil
+	assert.Equal(t, report.Endpoints, stored.Endpoints().AsSlice())
+	assert.True(t, report.Hostinfo.Equal(stored.Hostinfo().AsStruct()),
+		"accepted Hostinfo must remain unchanged, including lists longer than 256 entries")
+
+	c, err := app.state.UpdateNodeFromMapRequest(node.ID, report)
+	require.NoError(t, err)
+	assert.True(t, c.IsEmpty(),
+		"an unchanged report must not be a change, got %s", c.Type())
+}
+
+func TestPollNetMapHandler_RejectsOversizedClientReport(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name   string
+		report tailcfg.MapRequest
+		status int
+	}{
+		{
+			name:   "zoned IPv6 endpoint",
+			report: tailcfg.MapRequest{Endpoints: []netip.AddrPort{netip.MustParseAddrPort("[fe80::1%eth0]:41641")}},
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "hostname",
+			report: tailcfg.MapRequest{Hostinfo: &tailcfg.Hostinfo{
+				Hostname: strings.Repeat("h", types.MaxHostnameLength+1),
+			}},
+		},
+		{
+			name: "requested tags",
+			report: tailcfg.MapRequest{Hostinfo: &tailcfg.Hostinfo{
+				RequestTags: slices.Repeat([]string{"tag:test"}, types.MaxRequestTags+1),
+			}},
+		},
+		{
+			name: "metadata",
+			report: tailcfg.MapRequest{Hostinfo: &tailcfg.Hostinfo{
+				OSVersion: strings.Repeat("v", types.MaxHostinfoSize),
+			}},
+		},
+		{
+			name: "netinfo",
+			report: tailcfg.MapRequest{Hostinfo: &tailcfg.Hostinfo{
+				NetInfo: &tailcfg.NetInfo{LinkType: strings.Repeat("l", types.MaxHostinfoSize)},
+			}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			app := createTestApp(t)
+			user := app.state.CreateUserForTest("rejected-report")
+			node := putTestNodeInStore(t, app, user, "rejected-report")
+			before, ok := app.state.GetNodeByID(node.ID)
+			require.True(t, ok)
+
+			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+			rec := httptest.NewRecorder()
+			tt.report.Version = tailcfg.CurrentCapabilityVersion
+
+			tt.report.NodeKey = node.NodeKey
+			if tt.status == 0 {
+				tt.status = http.StatusRequestEntityTooLarge
+			}
+
+			ns.PollNetMapHandler(rec, newMapRequest(t, tt.report))
+			assert.Equal(t, tt.status, rec.Code, "body=%q", rec.Body.String())
+
+			after, ok := app.state.GetNodeByID(node.ID)
+			require.True(t, ok)
+			assert.Equal(t, before, after, "rejection must not mutate the node")
+		})
+	}
+}
+
+func TestPollNetMapHandler_UnknownNodeBeforeReportValidation(t *testing.T) {
+	t.Parallel()
+	app := createTestApp(t)
+	ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+	rec := httptest.NewRecorder()
+	ns.PollNetMapHandler(rec, newMapRequest(t, tailcfg.MapRequest{
+		Version: tailcfg.CurrentCapabilityVersion, NodeKey: key.NewNode().Public(),
+		Hostinfo: &tailcfg.Hostinfo{Hostname: strings.Repeat("h", types.MaxHostnameLength+1)},
+	}))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestRegistrationHandler_ValidatesClientReport(t *testing.T) {
+	t.Parallel()
+
+	t.Run("pending registration retains auth metadata", func(t *testing.T) {
+		t.Parallel()
+
+		app := createTestApp(t)
+		ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+
+		rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+			Version: tailcfg.CurrentCapabilityVersion,
+			NodeKey: key.NewNode().Public(),
+			Hostinfo: &tailcfg.Hostinfo{
+				Hostname:    "report-pending-node",
+				OS:          "linux",
+				OSVersion:   "6.12",
+				RequestTags: []string{"tag:test"},
+				Services:    manyServices(300),
+				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
+				NetInfo:     &tailcfg.NetInfo{PreferredDERP: 1},
+			},
+		})
+		require.Equal(t, http.StatusOK, rec.Code, "body=%q", rec.Body.String())
+
+		var resp tailcfg.RegisterResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+
+		authID, err := extractRegistrationIDFromAuthURL(resp.AuthURL)
+		require.NoError(t, err, "resp=%+v", resp)
+
+		entry, ok := app.state.GetAuthCacheEntry(authID)
+		require.True(t, ok)
+		assert.Equal(t, &tailcfg.Hostinfo{
+			Hostname:    "report-pending-node",
+			OS:          "linux",
+			RequestTags: []string{"tag:test"},
+		}, entry.RegistrationData().Hostinfo)
+	})
+
+	t.Run("followup discards unused request data", func(t *testing.T) {
+		t.Parallel()
+		app := createTestApp(t)
+		ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+		rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+			Version: tailcfg.CurrentCapabilityVersion, NodeKey: key.NewNode().Public(),
+			Followup: "http://localhost:8080/register/" + types.MustAuthID().String(),
+			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: "unused-followup-key"},
+			Hostinfo: &tailcfg.Hostinfo{
+				Hostname: "followup-node", OS: "linux", RequestTags: []string{"tag:test"},
+				OSVersion: strings.Repeat("v", types.MaxHostinfoSize),
+			},
+			DeviceCert: []byte("unused"), Signature: []byte("unused"), Tailnet: "unused",
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
+
+		var resp tailcfg.RegisterResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		require.Empty(t, resp.Error)
+		authID, err := extractRegistrationIDFromAuthURL(resp.AuthURL)
+		require.NoError(t, err)
+
+		entry, ok := app.state.GetAuthCacheEntry(authID)
+		require.True(t, ok)
+		assert.Equal(t, &tailcfg.Hostinfo{
+			Hostname: "followup-node", OS: "linux", RequestTags: []string{"tag:test"},
+		}, entry.RegistrationData().Hostinfo)
+	})
+
+	t.Run("oversized report", func(t *testing.T) {
+		t.Parallel()
+
+		// A nil headscale proves rejection happens before any state access.
+		ns := &noiseServer{machineKey: key.NewMachine().Public()}
+
+		rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+			Version: tailcfg.CurrentCapabilityVersion,
+			NodeKey: key.NewNode().Public(),
+			Hostinfo: &tailcfg.Hostinfo{
+				OSVersion: strings.Repeat("v", types.MaxHostinfoSize),
+			},
+		})
+		require.Equal(t, http.StatusOK, rec.Code, "body=%q", rec.Body.String())
+
+		var resp tailcfg.RegisterResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		assert.Contains(t, resp.Error, types.ErrHostinfoTooLarge.Error())
+		assert.Empty(t, resp.AuthURL)
+	})
+
+	t.Run("pre-auth key trims routes and drops unused latency", func(t *testing.T) {
+		t.Parallel()
+		app := createTestApp(t)
+		user := app.state.CreateUserForTest("trim-pak-user")
+		pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+		require.NoError(t, err)
+
+		nodeKey := key.NewNode().Public()
+		ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+		rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+			Version: tailcfg.CurrentCapabilityVersion, NodeKey: nodeKey,
+			Auth: &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+			Hostinfo: &tailcfg.Hostinfo{
+				Hostname:    "trim-pak-node",
+				RoutableIPs: slices.Repeat([]netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, types.MaxRoutableIPs+1),
+				NetInfo:     &tailcfg.NetInfo{PreferredDERP: 1, DERPLatency: map[string]float64{"1-v4": 0.01}},
+			},
+		})
+		require.Equal(t, http.StatusOK, rec.Code)
+
+		var resp tailcfg.RegisterResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		require.Empty(t, resp.Error)
+
+		node, ok := app.state.GetNodeByNodeKey(nodeKey)
+		require.True(t, ok)
+
+		hi := node.Hostinfo().AsStruct()
+		assert.Len(t, hi.RoutableIPs, types.MaxRoutableIPs)
+		assert.Equal(t, tailcfg.DERPRegionID(1), hi.NetInfo.PreferredDERP)
+		assert.Nil(t, hi.NetInfo.DERPLatency)
+	})
+
+	t.Run("oversized report leaves pre-auth key unused", func(t *testing.T) {
+		t.Parallel()
+
+		app := createTestApp(t)
+		user := app.state.CreateUserForTest("report-pak-user")
+
+		pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+		require.NoError(t, err)
+
+		nodeKey := key.NewNode().Public()
+		ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+
+		rec := serveRegister(t, ns, tailcfg.RegisterRequest{
+			Version:  tailcfg.CurrentCapabilityVersion,
+			NodeKey:  nodeKey,
+			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+			Hostinfo: &tailcfg.Hostinfo{Hostname: strings.Repeat("p", types.MaxHostnameLength+1)},
+		})
+		require.Equal(t, http.StatusOK, rec.Code, "body=%q", rec.Body.String())
+
+		var resp tailcfg.RegisterResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		assert.Contains(t, resp.Error, types.ErrHostinfoTooLarge.Error())
+		assert.Empty(t, resp.AuthURL)
+
+		_, ok := app.state.GetNodeByNodeKey(nodeKey)
+		assert.False(t, ok)
+
+		stored, err := app.state.GetPreAuthKey(pak.Key)
+		require.NoError(t, err)
+		assert.False(t, stored.Used)
+	})
+}
+
+// TestNoiseHTTPServerTimeouts pins the limits of the server inside a Noise
+// tunnel. Any machine key gets a tunnel, so without them a stalled request
+// body or an empty tunnel lives as long as the TCP connection.
+func TestNoiseHTTPServerTimeouts(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 200 * time.Millisecond
+
+	// serve runs handler the way NoiseUpgradeHandler serves a tunnel. It
+	// returns a client for the tunnel and a channel closed once the server
+	// has closed the connection.
+	serve := func(t *testing.T, handler http.Handler) (*http.Client, <-chan struct{}) {
+		t.Helper()
+
+		serverConn, clientConn := net.Pipe()
+
+		t.Cleanup(func() {
+			serverConn.Close()
+			clientConn.Close()
+		})
+
+		closed := make(chan struct{})
+		srv := newNoiseHTTPServer(handler, timeout)
+		srv.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				close(closed)
+			}
+		}
+
+		go func() { _ = srv.Serve(netutil.NewOneConnListener(serverConn, nil)) }()
+
+		protocols := new(http.Protocols)
+		protocols.SetUnencryptedHTTP2(true)
+
+		transport := &http.Transport{
+			Protocols: protocols,
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return clientConn, nil
+			},
+		}
+		t.Cleanup(transport.CloseIdleConnections)
+
+		return &http.Client{Transport: transport}, closed
+	}
+
+	t.Run("stalled body times out", func(t *testing.T) {
+		t.Parallel()
+
+		readErr := make(chan error, 1)
+		client, _ := serve(t, http.HandlerFunc(func(
+			_ http.ResponseWriter, r *http.Request,
+		) {
+			_, err := io.ReadAll(r.Body)
+			readErr <- err
+		}))
+
+		// One byte of body, then silence.
+		body, bodyWriter := io.Pipe()
+
+		t.Cleanup(func() { bodyWriter.Close() })
+
+		go func() { _, _ = bodyWriter.Write([]byte("{")) }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*timeout)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, "http://noise/machine/register", body,
+		)
+		require.NoError(t, err)
+
+		resp, err := client.Do(req)
+		require.NoError(t, err, "the handler must not stay blocked on a stalled body")
+		resp.Body.Close()
+
+		require.ErrorIs(t, <-readErr, os.ErrDeadlineExceeded)
+	})
+
+	// set-dns answers only once the nameservers serve the record, which can
+	// take longer than the timeout, and writes nothing until then.
+	t.Run("quiet answer past the timeout is delivered", func(t *testing.T) {
+		t.Parallel()
+
+		client, _ := serve(t, http.HandlerFunc(func(
+			w http.ResponseWriter, r *http.Request,
+		) {
+			_, _ = io.ReadAll(r.Body)
+
+			select {
+			case <-time.After(3 * timeout):
+			case <-r.Context().Done():
+				return
+			}
+
+			_, _ = io.WriteString(w, "{}")
+		}))
+
+		req, err := http.NewRequestWithContext(
+			context.Background(), http.MethodPost, "http://noise/machine/set-dns",
+			strings.NewReader("{}"),
+		)
+		require.NoError(t, err)
+
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		assert.Equal(t, "{}", string(got))
+	})
+
+	t.Run("long poll is kept, then the idle tunnel closes", func(t *testing.T) {
+		t.Parallel()
+
+		const chunks = 5
+
+		client, closed := serve(t, http.HandlerFunc(func(
+			w http.ResponseWriter, r *http.Request,
+		) {
+			_, _ = io.ReadAll(r.Body)
+
+			for range chunks {
+				_, _ = io.WriteString(w, "chunk\n")
+				w.(http.Flusher).Flush() //nolint:forcetypeassert // h2 writers flush
+
+				select {
+				case <-time.After(timeout):
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}))
+
+		req, err := http.NewRequestWithContext(
+			context.Background(), http.MethodPost, "http://noise/machine/map",
+			strings.NewReader("{}"),
+		)
+		require.NoError(t, err)
+
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.NoError(t, err)
+		assert.Equal(t, strings.Repeat("chunk\n", chunks), string(got),
+			"a stream that outlives the timeout must not be cut")
+
+		select {
+		case <-closed:
+		case <-time.After(10 * timeout):
+			t.Fatal("the server kept a tunnel with no open stream")
+		}
+	})
+}
+
+// TestSSHActionFollowUp_ParksOneRequestPerSession pins that a pending SSH
+// check keeps one waiting follow-up, the newest. Older waiters re-delegate at
+// once instead of staying parked until the session ends.
+func TestSSHActionFollowUp_ParksOneRequestPerSession(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	nodes := putSSHCheckNodes(t, app, "ssh-park-user", "src-node", "dst-node")
+	src, dst := nodes[0], nodes[1]
+
+	authID := types.MustAuthID()
+	auth := types.NewSSHCheckAuthRequest(src.ID, dst.ID)
+	require.NoError(t, app.state.SetAuthCacheEntry(authID, auth))
+
+	ns := &noiseServer{headscale: app, machineKey: dst.MachineKey}
+
+	const followups = 50
+
+	type answer struct {
+		action *tailcfg.SSHAction
+		err    error
+	}
+
+	answered := make(chan answer, followups)
+
+	for range followups {
+		go func() {
+			action, err := ns.sshActionFollowUp(
+				t.Context(), zerolog.Nop(), &tailcfg.SSHAction{},
+				authID.String(), src.ID, dst.ID, sshTestLocalUser,
+			)
+			answered <- answer{action, err}
+		}()
+	}
+
+	next := func(msg string) answer {
+		t.Helper()
+
+		select {
+		case a := <-answered:
+			return a
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, msg)
+
+			return answer{}
+		}
+	}
+
+	for range followups - 1 {
+		a := next("more than one follow-up is parked on the session")
+		require.NoError(t, a.err)
+		assert.NotEqual(t, authID, requireSSHHold(t, *a.action),
+			"re-delegation must mint a new session")
+	}
+
+	select {
+	case a := <-answered:
+		require.FailNowf(t, "the newest follow-up must still be waiting", "got %+v", a)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	auth.FinishAuth(types.AuthVerdict{})
+
+	last := next("the parked follow-up did not collect the verdict")
+	require.NoError(t, last.err)
+	assert.True(t, last.action.Accept, "accept, got %+v", last.action)
 }

@@ -23,20 +23,23 @@ import (
 // folding to the drain.
 const minPendingFold = 64
 
+const maxConcurrentMapSessionsPerNode = 4
+
 // errNoActiveConnections is returned by [multiChannelNodeConn.send] when a node
 // has no active connections (disconnected but kept in the batcher for rapid
 // reconnection). Callers must not update peer tracking state (lastSentPeers)
 // after this error because the data was never delivered to any client.
 var errNoActiveConnections = errors.New("no active connections")
 
-// errNoReadyConnections is returned by [multiChannelNodeConn.send] when the
-// node's only connections are still waiting for their initial map
-// ([Batcher.AddNode] has registered them but not yet delivered the first full
-// response). Sending a delta now would make it the stream's first frame, which
-// Tailscale clients reject ("initial MapResponse lacked Node") — tearing down
-// the poll. Unlike [errNoActiveConnections], the change must be retried: the
-// in-flight initial map may have been generated from a snapshot older than
-// the change, so dropping it would lose the update.
+// errNoReadyConnections is returned by [multiChannelNodeConn.send], having
+// sent nothing, when any of the node's connections is still waiting for its
+// initial map ([Batcher.AddNode] has registered it but not yet delivered the
+// first full response). Sending a delta to it now would make it the stream's
+// first frame, which Tailscale clients reject ("initial MapResponse lacked
+// Node") — tearing down the poll. Unlike [errNoActiveConnections], the change
+// must be retried, and on every connection: the in-flight initial map may have
+// been generated from a snapshot older than the change, so dropping it would
+// lose the update.
 var errNoReadyConnections = errors.New("no connections ready for updates")
 
 // errConnectionBackpressure keeps unsent changes queued without declaring a busy client dead.
@@ -44,6 +47,11 @@ var errConnectionBackpressure = errors.New("connection queue full")
 
 // Match the initial-map timeout while staying below reconnect grace and client keepalive.
 const connectionStallTimeout = 5 * time.Second
+
+// connectionSendWait is how long one send waits for room on a connection
+// before it counts as backpressure, and how long all sends of one bundle
+// may wait before [Batcher.worker] retries the rest next tick.
+const connectionSendWait = 50 * time.Millisecond
 
 // A full snapshot supersedes state backlog past this size; pings remain
 // one-shot work.
@@ -65,7 +73,7 @@ type connectionEntry struct {
 
 	// pendingInitial is set by [Batcher.AddNode] while this
 	// connection's initial map is still in flight, and cleared once it
-	// is delivered. Broadcast sends skip such connections so a delta
+	// is delivered. Broadcast sends to the node wait for it, so a delta
 	// can never become the stream's first frame ahead of the initial
 	// map. The zero value means the connection is ready.
 	pendingInitial atomic.Bool
@@ -146,6 +154,13 @@ type multiChannelNodeConn struct {
 	// cannot reorder bundles that never coexist.
 	inFlight atomic.Bool
 
+	// sendBlocked is how long [multiChannelNodeConn.send] has waited on
+	// connections during the current bundle. The node decides how fast its
+	// connections drain and, through its own map requests, how many
+	// responses a bundle carries, while the worker holding workMu serves
+	// every node.
+	sendBlocked atomic.Int64
+
 	closeOnce   sync.Once
 	updateCount atomic.Int64
 
@@ -163,6 +178,12 @@ type multiChannelNodeConn struct {
 
 	// Partial additions remain removal candidates when retries render newer state.
 	partialPeers *xsync.Map[tailcfg.NodeID, struct{}]
+
+	// trackedInitialMaps counts initial maps recorded in lastSentPeers.
+	// [Batcher.AddNode] records its map after sending it, outside the workMu
+	// hold that built it, so a change across that gap means another stream's
+	// map, possibly built later, was recorded in between.
+	trackedInitialMaps atomic.Uint64
 }
 
 // connIDCounter is a monotonically increasing counter used to generate
@@ -225,8 +246,25 @@ func (mc *multiChannelNodeConn) removeConnectionAtIndexLocked(i int, stopConnect
 
 // addConnection adds a new connection.
 func (mc *multiChannelNodeConn) addConnection(entry *connectionEntry) {
+	mc.addConnectionWithLimit(entry, 0)
+}
+
+// addConnectionWithLimit atomically adds a connection while keeping at most
+// limit overlapping sessions. The oldest session is stopped and replaced when
+// the limit is full, allowing normal client poll churn to make progress. A zero
+// limit keeps the unbounded behavior used by low-level tests and benchmarks.
+func (mc *multiChannelNodeConn) addConnectionWithLimit(
+	entry *connectionEntry,
+	limit int,
+) {
 	mc.mutex.Lock()
 	defer mc.mutex.Unlock()
+
+	for limit > 0 && len(mc.connections) >= limit {
+		replaced := mc.removeConnectionAtIndexLocked(0, true)
+		mc.log.Debug().Str(zf.ConnID, replaced.id).
+			Msg("oldest overlapping connection replaced")
+	}
 
 	mc.connections = append(mc.connections, entry)
 	mc.log.Debug().Str(zf.ConnID, entry.id).
@@ -254,11 +292,10 @@ func (mc *multiChannelNodeConn) removeConnectionByChannel(c chan<- *tailcfg.MapR
 }
 
 // detach removes the connection for the given channel and marks the node
-// disconnected if no active connections remain.
+// disconnected if no active connections remain. A connection already gone
+// was evicted, and the newer stream that evicted it owns the node's state.
 func (mc *multiChannelNodeConn) detach(c chan<- *tailcfg.MapResponse) {
-	mc.removeConnectionByChannel(c)
-
-	if !mc.hasActiveConnections() {
+	if mc.removeConnectionByChannel(c) && !mc.hasActiveConnections() {
 		mc.markDisconnected()
 	}
 }
@@ -303,6 +340,10 @@ func (mc *multiChannelNodeConn) isConnected() bool {
 	return mc.disconnectedAt.Load() == nil
 }
 
+func (mc *multiChannelNodeConn) isOffline() bool {
+	return mc != nil && !mc.hasActiveConnections()
+}
+
 // offlineDuration returns how long the node has been disconnected.
 // Returns 0 if the node is connected or has never been marked as disconnected.
 func (mc *multiChannelNodeConn) offlineDuration() time.Duration {
@@ -321,7 +362,7 @@ func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 
 	mc.pending = append(mc.pending, changes...)
 	mc.pendingSize += changesSize(changes)
-	fullAtHead := len(mc.pending) > 0 && mc.pending[0].IsFull()
+	fullAtHead := startsWithFullUpdate(mc.pending)
 
 	// Pending drains only once the bundle in flight is delivered, so behind
 	// workers it grew by every change; it renders folded anyway, and
@@ -345,8 +386,7 @@ func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 // online/offline.
 func (mc *multiChannelNodeConn) prependPending(changes ...change.Change) {
 	mc.pendingMu.Lock()
-	full := (len(mc.pending) > 0 && mc.pending[0].IsFull()) ||
-		(len(changes) > 0 && changes[0].IsFull())
+	full := startsWithFullUpdate(mc.pending) || startsWithFullUpdate(changes)
 
 	mc.pending = append(changes, mc.pending...)
 	mc.pendingSize += changesSize(changes)
@@ -355,6 +395,10 @@ func (mc *multiChannelNodeConn) prependPending(changes ...change.Change) {
 		mc.setPendingLocked(change.CollapseToFull(mc.id, mc.pending))
 	}
 	mc.pendingMu.Unlock()
+}
+
+func startsWithFullUpdate(changes []change.Change) bool {
+	return len(changes) > 0 && changes[0].IsFull()
 }
 
 // collapsePendingToFull replaces pending, together with incoming, by a
@@ -417,9 +461,9 @@ func (mc *multiChannelNodeConn) takePending() []change.Change {
 // To avoid holding the write lock during bounded channel waits, the method
 // snapshots connections under a read lock, sends without any lock held, then
 // write-locks only to remove failures. New connections added between the
-// snapshot and cleanup are safe:
-// they receive a full initial map via [Batcher.AddNode], so missing this update
-// causes no data loss.
+// snapshot and cleanup are safe: [Batcher.AddNode] generates their initial
+// map under workMu, after this bundle, so missing this update causes no data
+// loss.
 func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 	if data == nil {
 		return nil
@@ -436,27 +480,22 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		return errNoActiveConnections
 	}
 
-	// Copy only connections whose initial map has been delivered.
-	// A connection still awaiting its initial map receives one
-	// (generated from the current snapshot) from [Batcher.AddNode];
-	// pushing this update at it now would deliver a delta as the
-	// stream's first frame.
-	snapshot := make([]*connectionEntry, 0, len(mc.connections))
-
-	for _, conn := range mc.connections {
-		if !conn.pendingInitial.Load() {
-			snapshot = append(snapshot, conn)
-		}
-	}
-
-	mc.mutex.RUnlock()
-
-	if len(snapshot) == 0 {
+	// A connection still awaiting its initial map must not get this
+	// update first, and the map may predate it: send to none until the
+	// map is out, see [errNoReadyConnections].
+	if slices.ContainsFunc(mc.connections, func(conn *connectionEntry) bool {
+		return conn.pendingInitial.Load()
+	}) {
+		mc.mutex.RUnlock()
 		mc.log.Trace().
-			Msg("send: connections present but none ready, requeue")
+			Msg("send: a connection awaits its initial map, requeue")
 
 		return errNoReadyConnections
 	}
+
+	snapshot := slices.Clone(mc.connections)
+
+	mc.mutex.RUnlock()
 
 	mc.log.Trace().
 		Int("total_connections", len(snapshot)).
@@ -472,8 +511,19 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		newestAccepted bool
 	)
 
+	start := time.Now()
+	defer func() { mc.sendBlocked.Add(int64(time.Since(start))) }()
+
 	for _, conn := range snapshot {
-		err := conn.send(conn.withSSHPolicyDelta(conn.withSelfDelta(data)))
+		stripped := conn.withSSHPolicyDelta(conn.withSelfDelta(data))
+
+		// Stripping can leave this stream nothing new, like the visibility
+		// filtering at build time.
+		if stripped != data && emptyMapResponse(stripped) {
+			stripped = nil
+		}
+
+		err := conn.send(stripped)
 		if errors.Is(err, errConnectionBackpressure) {
 			blocked = append(blocked, conn)
 			continue
@@ -574,7 +624,7 @@ func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
 	//
 	// Use a timer rather than time.After so the timeout is explicitly released
 	// on the fast path; both are GC-recoverable since Go 1.23.
-	timer := time.NewTimer(50 * time.Millisecond) //nolint:mnd
+	timer := time.NewTimer(connectionSendWait)
 	defer timer.Stop()
 
 	select {

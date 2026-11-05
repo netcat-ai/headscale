@@ -10,6 +10,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 )
@@ -22,13 +23,15 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 	defer pm.mu.RUnlock()
 
 	type nodeRoutes struct {
-		subnet []netip.Prefix
+		subnet []netipx.IPRange
 		isExit bool
 	}
 
 	routeInfo := make(map[types.NodeID]nodeRoutes, nodes.Len())
 	for _, n := range nodes.All() {
-		routeInfo[n.ID()] = nodeRoutes{subnet: n.SubnetRoutes(), isExit: n.IsExitNode()}
+		routeInfo[n.ID()] = nodeRoutes{
+			subnet: types.RouteRanges(n.SubnetRoutes()), isExit: n.IsExitNode(),
+		}
 	}
 
 	ret := make(map[types.NodeID][]types.NodeID, nodes.Len())
@@ -41,8 +44,10 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 				}
 
 				ri, rj := routeInfo[nodes.At(i).ID()], routeInfo[nodes.At(j).ID()]
-				if nodes.At(i).CanAccessWithRoutes(pm.matchers, nodes.At(j), ri.subnet, rj.subnet, rj.isExit) ||
-					nodes.At(j).CanAccessWithRoutes(pm.matchers, nodes.At(i), rj.subnet, ri.subnet, ri.isExit) {
+
+				linked := nodes.At(i).CanAccessWithRoutes(pm.matchers, nodes.At(j), ri.subnet, rj.subnet, rj.isExit) ||
+					nodes.At(j).CanAccessWithRoutes(pm.matchers, nodes.At(i), rj.subnet, ri.subnet, ri.isExit)
+				if linked || sameUser(nodes.At(i), nodes.At(j)) {
 					ret[nodes.At(i).ID()] = append(ret[nodes.At(i).ID()], nodes.At(j).ID())
 					ret[nodes.At(j).ID()] = append(ret[nodes.At(j).ID()], nodes.At(i).ID())
 				}
@@ -54,7 +59,7 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
 	for _, node := range nodes.All() {
-		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.filterRulesForNodeLocked(node))
+		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(pm.peerRulesForNodeLocked(node))
 	}
 
 	for i := range nodes.Len() {
@@ -67,10 +72,13 @@ func buildPeerMapPairScan(pm *PolicyManager, nodes views.Slice[types.NodeView]) 
 			matchersJ, hasFilterJ := nodeMatchers[nodeJ.ID()]
 			riJ := routeInfo[nodeJ.ID()]
 
-			if hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit) ||
-				hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit) ||
-				hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit) ||
-				hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit) {
+			canIAccessJ := hasFilterI && nodeI.CanAccessWithRoutes(matchersI, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+			canJAccessI := hasFilterJ && nodeJ.CanAccessWithRoutes(matchersJ, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canJReachI := hasFilterI && nodeJ.CanAccessWithRoutes(matchersI, nodeI, riJ.subnet, riI.subnet, riI.isExit)
+			canIReachJ := hasFilterJ && nodeI.CanAccessWithRoutes(matchersJ, nodeJ, riI.subnet, riJ.subnet, riJ.isExit)
+
+			linked := canIAccessJ || canJAccessI || canJReachI || canIReachJ
+			if linked || sameUser(nodeI, nodeJ) {
 				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ.ID())
 				ret[nodeJ.ID()] = append(ret[nodeJ.ID()], nodeI.ID())
 			}
@@ -225,6 +233,12 @@ func scanRandomPolicy(r *rand.Rand) []byte {
 		g := map[string]any{"src": src, "dst": dst, "ip": [][]string{{"*"}, {"tcp:443"}, {"icmp:*"}, {"udp:53", "tcp:22"}}[r.IntN(4)]}
 		if r.IntN(8) == 0 {
 			g["via"] = []string{[]string{"tag:router", "tag:exit"}[r.IntN(2)]}
+
+			// Capability only: via changes nothing, unlike a via grant with ports.
+			if r.IntN(2) == 0 {
+				delete(g, "ip")
+				g["app"] = map[string]any{"example.com/cap/test": []map[string]any{{}}}
+			}
 		}
 
 		grants = append(grants, g)
@@ -569,8 +583,8 @@ func buildPeerMapSortedSlice(
 				continue
 			}
 
-			if sortedMatcherSetsIntersect(srcOf[i], dstOf[j]) ||
-				sortedMatcherSetsIntersect(srcOf[j], dstOf[i]) {
+			linked := sortedMatcherSetsIntersect(srcOf[i], dstOf[j]) || sortedMatcherSetsIntersect(srcOf[j], dstOf[i])
+			if linked || sameUser(nodes.At(i), nodes.At(j)) {
 				ret[ids[i]] = append(ret[ids[i]], ids[j])
 				ret[ids[j]] = append(ret[ids[j]], ids[i])
 			}
@@ -665,8 +679,8 @@ func buildPeerMapSliceMap(
 				continue
 			}
 
-			if sliceMapMatcherSetsIntersect(srcOf[i], dstOf[j]) ||
-				sliceMapMatcherSetsIntersect(srcOf[j], dstOf[i]) {
+			linked := sliceMapMatcherSetsIntersect(srcOf[i], dstOf[j]) || sliceMapMatcherSetsIntersect(srcOf[j], dstOf[i])
+			if linked || sameUser(nodes.At(i), nodes.At(j)) {
 				ret[ids[i]] = append(ret[ids[i]], ids[j])
 				ret[ids[j]] = append(ret[ids[j]], ids[i])
 			}

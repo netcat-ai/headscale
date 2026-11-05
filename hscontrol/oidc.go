@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -29,10 +31,10 @@ const (
 	defaultOAuthOptionsCount = 3
 	authCacheExpiration      = time.Minute * 15
 
-	// authCacheMaxEntries bounds the OIDC state→[AuthInfo] cache to prevent
-	// unauthenticated cache-fill DoS via repeated /register/{auth_id} or
-	// /auth/{auth_id} GETs that mint OIDC state cookies.
+	// Registrations may use authCacheMaxEntries slots; SSH checks may also use
+	// the reserve so new registrations cannot fill all pending OIDC capacity.
 	authCacheMaxEntries = 1024
+	authCacheSSHReserve = 64
 
 	// cookieNamePrefixLen is the number of leading characters from a
 	// state/nonce value that [getCookieName] splices into the cookie name.
@@ -47,7 +49,6 @@ var errOIDCStateTooShort = errors.New("oidc state parameter is too short")
 var (
 	errEmptyOIDCCallbackParams = errors.New("empty OIDC callback params")
 	errNoOIDCIDToken           = errors.New("extracting ID token")
-	errNoOIDCRegistrationInfo  = errors.New("registration info not in cache")
 	errOIDCAllowedDomains      = errors.New(
 		"authenticated principal does not match any allowed domain",
 	)
@@ -71,10 +72,11 @@ type AuthProviderOIDC struct {
 	serverURL string
 	cfg       *types.OIDCConfig
 
-	// authCache holds auth information between the auth and the callback
-	// steps. It is a bounded [expirable.LRU] keyed by OIDC state, evicting oldest
-	// entries to keep the cache footprint constant under attack.
-	authCache *expirable.LRU[string, AuthInfo]
+	// authCacheMu serializes non-evicting admission and single-use consumption.
+	// Reads use Peek to preserve insertion order, so the oldest entry expires first.
+	authCacheMu            sync.Mutex
+	authCacheRegistrations atomic.Int64
+	authCache              *expirable.LRU[string, AuthInfo]
 
 	oidcProvider *oidc.Provider
 	oauth2Config *oauth2.Config
@@ -101,21 +103,25 @@ func NewAuthProviderOIDC(
 		Scopes:       cfg.Scope,
 	}
 
-	authCache := expirable.NewLRU[string, AuthInfo](
-		authCacheMaxEntries,
-		nil,
-		authCacheExpiration,
-	)
-
-	return &AuthProviderOIDC{
+	a := &AuthProviderOIDC{
 		h:         h,
 		serverURL: serverURL,
 		cfg:       cfg,
-		authCache: authCache,
 
 		oidcProvider: oidcProvider,
 		oauth2Config: oauth2Config,
-	}, nil
+	}
+	a.authCache = expirable.NewLRU[string, AuthInfo](
+		authCacheMaxEntries+authCacheSSHReserve,
+		func(_ string, info AuthInfo) {
+			if info.Registration {
+				a.authCacheRegistrations.Add(-1)
+			}
+		},
+		authCacheExpiration,
+	)
+
+	return a, nil
 }
 
 // cookiesSecure reports whether the OIDC cookies should carry the Secure flag.
@@ -128,7 +134,7 @@ func (a *AuthProviderOIDC) cookiesSecure() bool {
 }
 
 func oidcCallbackURL(serverURL string) string {
-	return strings.TrimSuffix(serverURL, "/") + "/oidc/callback"
+	return serverURL + "/oidc/callback"
 }
 
 func (a *AuthProviderOIDC) oidcCallbackPath() string {
@@ -177,11 +183,24 @@ func (a *AuthProviderOIDC) authHandler(
 		return
 	}
 
-	// Set the state and nonce cookies to protect against CSRF attacks
-	state := a.setCSRFCookie(writer, req, "state")
+	authReq, ok := a.h.state.GetAuthCacheEntry(authID)
+	if !ok {
+		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
+		return
+	}
 
-	// Set the state and nonce cookies to protect against CSRF attacks
-	nonce := a.setCSRFCookie(writer, req, "nonce")
+	if registration && !authReq.IsRegistration() {
+		httpUserError(writer, NewHTTPError(http.StatusBadRequest, "auth session is not for node registration", nil))
+		return
+	}
+
+	if !registration && !authReq.IsSSHCheck() {
+		httpUserError(writer, NewHTTPError(http.StatusBadRequest, "auth session is not for SSH check", nil))
+		return
+	}
+
+	state := rands.HexString(64)
+	nonce := rands.HexString(64)
 
 	registrationInfo := AuthInfo{
 		AuthID:       authID,
@@ -218,8 +237,15 @@ func (a *AuthProviderOIDC) authHandler(
 
 	extras = append(extras, oidc.Nonce(nonce))
 
-	// Cache the registration info
-	a.authCache.Add(state, registrationInfo)
+	if !a.addAuthInfoToState(state, registrationInfo) {
+		writer.Header().Set("Retry-After", "10")
+		httpUserError(writer, NewHTTPError(http.StatusServiceUnavailable, "too many pending OIDC logins, try again later", nil))
+
+		return
+	}
+
+	a.setCSRFCookie(writer, req, "state", state)
+	a.setCSRFCookie(writer, req, "nonce", nonce)
 
 	authURL := a.oauth2Config.AuthCodeURL(state, extras...)
 	log.Debug().Caller().Msgf("redirecting to %s for authentication", authURL)
@@ -255,7 +281,20 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	oauth2Token, err := a.getOauth2Token(req.Context(), code, state)
+	// A cookie-bound callback spends its state even if authentication fails;
+	// retrying then requires a fresh login flow rather than reusing the callback.
+	authInfo := a.getAuthInfoFromState(state)
+	if authInfo == nil {
+		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
+		return
+	}
+
+	if req.URL.Query().Get("error") != "" {
+		httpUserError(writer, NewHTTPError(http.StatusForbidden, "OIDC authentication failed", nil))
+		return
+	}
+
+	oauth2Token, err := a.getOauth2Token(req.Context(), code, authInfo)
 	if err != nil {
 		httpUserError(writer, err)
 		return
@@ -310,18 +349,16 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	// The [oidc.UserInfo] type only decodes some fields (Subject, Profile, Email, EmailVerified).
 	// We are interested in other fields too (e.g. groups are required for allowedGroups) so we
 	// decode into our own [types.OIDCUserInfo] type using the underlying claims struct.
-	var userinfo2 types.OIDCUserInfo
-	if userinfo != nil && userinfo.Claims(&userinfo2) == nil && userinfo2.Sub == claims.Sub {
+	if userinfoClaims, ok := userInfoForSubject(userinfo, claims.Sub); ok {
 		// Update the user with the userinfo claims (with id token claims as fallback).
 		// TODO(kradalby): there might be more interesting fields here that we have not found yet.
-		claims.Email = cmp.Or(userinfo2.Email, claims.Email)
-		claims.EmailVerified = cmp.Or(userinfo2.EmailVerified, claims.EmailVerified)
-		claims.Username = cmp.Or(userinfo2.PreferredUsername, claims.Username)
-		claims.Name = cmp.Or(userinfo2.Name, claims.Name)
+		claims.Email, claims.EmailVerified = mergeEmailClaims(&claims, &userinfoClaims)
+		claims.Username = cmp.Or(userinfoClaims.PreferredUsername, claims.Username)
+		claims.Name = cmp.Or(userinfoClaims.Name, claims.Name)
 
-		claims.ProfilePictureURL = cmp.Or(userinfo2.Picture, claims.ProfilePictureURL)
-		if userinfo2.Groups != nil {
-			claims.Groups = userinfo2.Groups
+		claims.ProfilePictureURL = cmp.Or(userinfoClaims.Picture, claims.ProfilePictureURL)
+		if userinfoClaims.Groups != nil {
+			claims.Groups = userinfoClaims.Groups
 		}
 	}
 
@@ -333,7 +370,14 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	user, _, err := a.createOrUpdateUserFromClaim(&claims)
+	if !claims.IdentifierKeepsSubject() {
+		log.Warn().Str("subject", claims.Sub).Msg("OIDC subject would be altered by provider identifier cleaning")
+		httpUserError(writer, NewHTTPError(http.StatusForbidden, "OIDC subject cannot be used as a provider identifier", nil))
+
+		return
+	}
+
+	user, userChange, err := a.createOrUpdateUserFromClaim(&claims)
 	if err != nil {
 		httpUserError(writer, NewHTTPError(
 			http.StatusInternalServerError,
@@ -344,105 +388,34 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	// TODO(kradalby): Is this comment right?
-	// If the node exists, then the node should be reauthenticated,
-	// if the node does not exist, and the machine key exists, then
-	// this is a new node that should be registered.
-	authInfo := a.getAuthInfoFromState(state)
-	if authInfo == nil {
-		log.Debug().Caller().Str("state", state).Msg("state not found in cache, login session may have expired")
-		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
+	a.h.Change(userChange)
 
-		return
+	a.beginConfirmation(writer, req, authInfo.AuthID, authInfo.Registration, user, nodeExpiry)
+}
+
+func userInfoForSubject(userinfo *oidc.UserInfo, subject string) (types.OIDCUserInfo, bool) {
+	var claims types.OIDCUserInfo
+	if userinfo == nil || userinfo.Claims(&claims) != nil {
+		return claims, false
 	}
 
-	// If this is a registration flow, render the confirmation
-	// interstitial instead of finalising the registration immediately.
-	// Without an explicit user click, a single GET to
-	// /register/{auth_id} could silently complete a registration when
-	// the IdP allows silent SSO.
-	if authInfo.Registration {
-		a.beginRegistrationConfirmation(writer, req, authInfo.AuthID, user, nodeExpiry)
+	return claims, claims.Sub == subject
+}
 
-		return
+// mergeEmailClaims keeps each verification flag with the address it describes.
+func mergeEmailClaims(
+	claims *types.OIDCClaims,
+	userinfo *types.OIDCUserInfo,
+) (string, types.FlexibleBoolean) {
+	if userinfo.Email == "" {
+		return claims.Email, claims.EmailVerified
 	}
 
-	// If this is not a registration callback, then it is an SSH
-	// check-mode auth callback. Confirm the OIDC identity is the owner
-	// of the SSH source node before recording approval; without this
-	// check any tailnet user could approve a check-mode prompt for any
-	// other user's node, defeating the stolen-key protection that
-	// check-mode is meant to provide.
-
-	authReq, ok := a.h.state.GetAuthCacheEntry(authInfo.AuthID)
-	if !ok {
-		log.Debug().Caller().Str("auth_id", authInfo.AuthID.String()).Msg("auth session expired before authorization completed")
-		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
-
-		return
+	if userinfo.Email == claims.Email {
+		return claims.Email, claims.EmailVerified || userinfo.EmailVerified
 	}
 
-	if !authReq.IsSSHCheck() {
-		log.Warn().Caller().
-			Str("auth_id", authInfo.AuthID.String()).
-			Msg("OIDC callback hit non-registration path with auth request that is not an SSH check binding")
-		httpUserError(writer, NewHTTPError(http.StatusBadRequest, "auth session is not for SSH check", nil))
-
-		return
-	}
-
-	binding := authReq.SSHCheckBinding()
-
-	srcNode, ok := a.h.state.GetNodeByID(binding.SrcNodeID)
-	if !ok {
-		log.Warn().Caller().
-			Str("auth_id", authInfo.AuthID.String()).
-			Uint64("src_node_id", binding.SrcNodeID.Uint64()).
-			Msg("SSH check src node no longer exists")
-		httpUserError(writer, NewHTTPError(http.StatusGone, "src node no longer exists", nil))
-
-		return
-	}
-
-	// Strict identity binding: only the user that owns the src node
-	// may approve an SSH check for that node. Tagged source nodes are
-	// rejected because they have no user owner to compare against.
-	if srcNode.IsTagged() || !srcNode.UserID().Valid() {
-		log.Warn().Caller().
-			Str("auth_id", authInfo.AuthID.String()).
-			Uint64("src_node_id", binding.SrcNodeID.Uint64()).
-			Bool("src_is_tagged", srcNode.IsTagged()).
-			Str("oidc_user", user.Username()).
-			Msg("SSH check rejected: src node has no user owner")
-		httpUserError(writer, NewHTTPError(http.StatusForbidden, "src node has no user owner", nil))
-
-		return
-	}
-
-	if srcNode.UserID().Get() != user.ID {
-		log.Warn().Caller().
-			Str("auth_id", authInfo.AuthID.String()).
-			Uint64("src_node_id", binding.SrcNodeID.Uint64()).
-			Uint("src_owner_id", srcNode.UserID().Get()).
-			Uint("oidc_user_id", user.ID).
-			Str("oidc_user", user.Username()).
-			Msg("SSH check rejected: OIDC user is not the owner of src node")
-		httpUserError(writer, NewHTTPError(http.StatusForbidden, "OIDC user is not the owner of the SSH source node", nil))
-
-		return
-	}
-
-	// Identity verified — record the verdict for the waiting follow-up.
-	authReq.FinishAuth(types.AuthVerdict{})
-
-	content := renderAuthSuccessTemplate(user)
-
-	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
-
-	if _, err := writer.Write(content.Bytes()); err != nil { //nolint:noinlineerr
-		util.LogErr(err, "Failed to write HTTP response")
-	}
+	return userinfo.Email, userinfo.EmailVerified
 }
 
 func (a *AuthProviderOIDC) determineNodeExpiry(idTokenExpiration time.Time) *time.Time {
@@ -456,10 +429,12 @@ func (a *AuthProviderOIDC) determineNodeExpiry(idTokenExpiration time.Time) *tim
 func extractCodeAndStateParamFromRequest(
 	req *http.Request,
 ) (string, string, error) {
-	code := req.URL.Query().Get("code")
-	state := req.URL.Query().Get("state")
+	query := req.URL.Query()
+	code := query.Get("code")
+	state := query.Get("state")
 
-	if code == "" || state == "" {
+	hasAuthenticationResult := code != "" || query.Get("error") != ""
+	if !hasAuthenticationResult || state == "" {
 		return "", "", NewHTTPError(http.StatusBadRequest, "missing code or state parameter", errEmptyOIDCCallbackParams)
 	}
 
@@ -478,19 +453,12 @@ func extractCodeAndStateParamFromRequest(
 func (a *AuthProviderOIDC) getOauth2Token(
 	ctx context.Context,
 	code string,
-	state string,
+	authInfo *AuthInfo,
 ) (*oauth2.Token, error) {
 	var exchangeOpts []oauth2.AuthCodeOption
 
-	if a.cfg.PKCE.Enabled {
-		regInfo, ok := a.authCache.Get(state)
-		if !ok {
-			return nil, NewHTTPError(http.StatusNotFound, "registration not found", errNoOIDCRegistrationInfo)
-		}
-
-		if regInfo.Verifier != nil {
-			exchangeOpts = []oauth2.AuthCodeOption{oauth2.VerifierOption(*regInfo.Verifier)}
-		}
+	if a.cfg.PKCE.Enabled && authInfo.Verifier != nil {
+		exchangeOpts = []oauth2.AuthCodeOption{oauth2.VerifierOption(*authInfo.Verifier)}
 	}
 
 	oauth2Token, err := a.oauth2Config.Exchange(ctx, code, exchangeOpts...)
@@ -616,16 +584,55 @@ func doOIDCAuthorization(
 	return nil
 }
 
+func (a *AuthProviderOIDC) addAuthInfoToState(state string, info AuthInfo) bool {
+	a.authCacheMu.Lock()
+	defer a.authCacheMu.Unlock()
+
+	// Len includes expired entries until the sweeper removes their bucket.
+	for {
+		oldest, _, ok := a.authCache.GetOldest()
+		if !ok {
+			break
+		}
+
+		if _, live := a.authCache.Peek(oldest); live {
+			break
+		}
+
+		a.authCache.Remove(oldest)
+	}
+
+	if a.authCache.Contains(state) || a.authCache.Len() >= a.authCache.Cap() {
+		return false
+	}
+
+	if info.Registration && a.authCacheRegistrations.Load() >= int64(a.authCache.Cap()-authCacheSSHReserve) {
+		return false
+	}
+
+	// Increment before Add: an expiry callback may run as soon as it is stored.
+	if info.Registration {
+		a.authCacheRegistrations.Add(1)
+	}
+
+	a.authCache.Add(state, info)
+
+	return true
+}
+
 // getAuthInfoFromState retrieves and consumes the auth info for a state. The
 // entry is removed on read so a state is single-use: a replayed callback cannot
 // resolve the same auth session twice, even within the cache TTL.
 func (a *AuthProviderOIDC) getAuthInfoFromState(state string) *AuthInfo {
-	authInfo, ok := a.authCache.Get(state)
+	a.authCacheMu.Lock()
+	defer a.authCacheMu.Unlock()
+
+	authInfo, ok := a.authCache.Peek(state)
+	a.authCache.Remove(state)
+
 	if !ok {
 		return nil
 	}
-
-	a.authCache.Remove(state)
 
 	return &authInfo
 }
@@ -739,7 +746,61 @@ func (a *AuthProviderOIDC) setRegisterConfirmCookie(
 	})
 }
 
-// beginRegistrationConfirmation captures the resolved OIDC identity and
+func (a *AuthProviderOIDC) sshCheckSource(
+	authID types.AuthID,
+	authReq *types.AuthRequest,
+	user *types.User,
+) (types.NodeView, error) {
+	if !authReq.IsSSHCheck() {
+		log.Warn().Caller().
+			Str("auth_id", authID.String()).
+			Msg("OIDC callback hit non-registration path with auth request that is not an SSH check binding")
+
+		return types.NodeView{}, NewHTTPError(http.StatusBadRequest, "auth session is not for SSH check", nil)
+	}
+
+	binding := authReq.SSHCheckBinding()
+
+	srcNode, ok := a.h.state.GetNodeByID(binding.SrcNodeID)
+	if !ok {
+		log.Warn().Caller().
+			Str("auth_id", authID.String()).
+			Uint64("src_node_id", binding.SrcNodeID.Uint64()).
+			Msg("SSH check src node no longer exists")
+
+		return types.NodeView{}, NewHTTPError(http.StatusGone, "src node no longer exists", nil)
+	}
+
+	// Strict identity binding: only the user that owns the src node
+	// may approve an SSH check for that node. Tagged source nodes are
+	// rejected because they have no user owner to compare against.
+	if srcNode.IsTagged() || !srcNode.UserID().Valid() {
+		log.Warn().Caller().
+			Str("auth_id", authID.String()).
+			Uint64("src_node_id", binding.SrcNodeID.Uint64()).
+			Bool("src_is_tagged", srcNode.IsTagged()).
+			Str("oidc_user", user.Username()).
+			Msg("SSH check rejected: src node has no user owner")
+
+		return types.NodeView{}, NewHTTPError(http.StatusForbidden, "src node has no user owner", nil)
+	}
+
+	if srcNode.UserID().Get() != user.ID {
+		log.Warn().Caller().
+			Str("auth_id", authID.String()).
+			Uint64("src_node_id", binding.SrcNodeID.Uint64()).
+			Uint("src_owner_id", srcNode.UserID().Get()).
+			Uint("oidc_user_id", user.ID).
+			Str("oidc_user", user.Username()).
+			Msg("SSH check rejected: OIDC user is not the owner of src node")
+
+		return types.NodeView{}, NewHTTPError(http.StatusForbidden, "OIDC user is not the owner of the SSH source node", nil)
+	}
+
+	return srcNode, nil
+}
+
+// beginConfirmation captures the resolved OIDC identity and
 // node expiry into the cached [types.AuthRequest], sets the CSRF cookie, and
 // redirects the browser to the confirmation page.
 //
@@ -751,28 +812,38 @@ func (a *AuthProviderOIDC) setRegisterConfirmCookie(
 // — re-enters the callback with a spent code and paints an error over the
 // interstitial. Redirecting keeps the code exchange one-shot and makes the
 // page the user waits on safe to reload.
-func (a *AuthProviderOIDC) beginRegistrationConfirmation(
+func (a *AuthProviderOIDC) beginConfirmation(
 	writer http.ResponseWriter,
 	req *http.Request,
 	authID types.AuthID,
+	registration bool,
 	user *types.User,
 	nodeExpiry *time.Time,
 ) {
 	authReq, ok := a.h.state.GetAuthCacheEntry(authID)
 	if !ok {
-		log.Debug().Caller().Str("auth_id", authID.String()).Msg("registration session expired before authorization completed")
+		log.Debug().Caller().Str("auth_id", authID.String()).Msg("auth session expired before authorization completed")
 		httpUserError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
 
 		return
 	}
 
-	if !authReq.IsRegistration() {
+	if registration && !authReq.IsRegistration() {
 		log.Warn().Caller().
 			Str("auth_id", authID.String()).
 			Msg("OIDC callback hit registration path with auth request that is not a node registration")
 		httpUserError(writer, NewHTTPError(http.StatusBadRequest, "auth session is not for node registration", nil))
 
 		return
+	}
+
+	if !registration {
+		_, err := a.sshCheckSource(authID, authReq, user)
+		if err != nil {
+			httpUserError(writer, err)
+
+			return
+		}
 	}
 
 	csrf := rands.HexString(32)
@@ -791,9 +862,9 @@ func (a *AuthProviderOIDC) beginRegistrationConfirmation(
 	http.Redirect(writer, req, a.registerConfirmURL(authID), http.StatusSeeOther)
 }
 
-// RegisterConfirmGetHandler renders the OIDC registration confirmation
+// RegisterConfirmGetHandler renders the OIDC registration or SSH confirmation
 // interstitial. It is reached via the redirect that
-// [AuthProviderOIDC.beginRegistrationConfirmation] issues from the OIDC
+// [AuthProviderOIDC.beginConfirmation] issues from the OIDC
 // callback, and it is safe to reload: it only reads the pending
 // confirmation captured on the cached [types.AuthRequest] and never touches
 // the one-time code exchange.
@@ -849,18 +920,46 @@ func (a *AuthProviderOIDC) RegisterConfirmGetHandler(
 		return
 	}
 
-	regData := authReq.RegistrationData()
-
 	info := templates.RegisterConfirmInfo{
 		FormAction:    a.registerConfirmURL(authID),
 		CSRFTokenName: registerConfirmCSRFCookie,
 		CSRFToken:     pending.CSRF,
 		User:          user.Display(),
-		Hostname:      regData.Hostname,
-		MachineKey:    regData.MachineKey.ShortString(),
 	}
-	if regData.Hostinfo != nil {
-		info.OS = regData.Hostinfo.OS
+
+	var content string
+
+	if authReq.IsSSHCheck() {
+		src, err := a.sshCheckSource(authID, authReq, user)
+		if err != nil {
+			httpUserError(writer, err)
+
+			return
+		}
+
+		dst, ok := a.h.state.GetNodeByID(authReq.SSHCheckBinding().DstNodeID)
+		if !ok {
+			httpUserError(writer, NewHTTPError(http.StatusGone, "destination node no longer exists", nil))
+
+			return
+		}
+
+		content = templates.SSHCheckConfirm(info, src.GivenName(), dst.GivenName()).Render()
+	} else {
+		regData := authReq.RegistrationData()
+		info.Hostname = regData.Hostname
+		info.MachineKey = regData.MachineKey.ShortString()
+
+		if node, ok := a.h.state.LoginNode(regData.MachineKey, types.UserID(user.ID)); ok {
+			info.ExistingNode = node.GivenName()
+		}
+
+		if regData.Hostinfo != nil {
+			info.OS = regData.Hostinfo.OS
+			info.Tags = regData.Hostinfo.RequestTags
+		}
+
+		content = templates.RegisterConfirm(info).Render()
 	}
 
 	// The page carries the token that finalises the registration, so no
@@ -869,15 +968,14 @@ func (a *AuthProviderOIDC) RegisterConfirmGetHandler(
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
 
-	if _, err := writer.Write([]byte(templates.RegisterConfirm(info).Render())); err != nil { //nolint:noinlineerr
+	if _, err := writer.Write([]byte(content)); err != nil { //nolint:noinlineerr
 		util.LogErr(err, "Failed to write HTTP response")
 	}
 }
 
 // RegisterConfirmHandler is the POST endpoint behind the OIDC
-// registration confirmation interstitial. It validates the CSRF cookie
-// against the form-submitted token, finalises the registration via
-// [AuthProviderOIDC.handleRegistration], and renders the success page.
+// confirmation interstitial. It validates the CSRF cookie against the
+// form-submitted token, then finalises registration or SSH approval.
 func (a *AuthProviderOIDC) RegisterConfirmHandler(
 	writer http.ResponseWriter,
 	req *http.Request,
@@ -947,28 +1045,48 @@ func (a *AuthProviderOIDC) RegisterConfirmHandler(
 		return
 	}
 
-	newNode, err := a.handleRegistration(user, authID, pending.NodeExpiry)
-	if err != nil {
-		if errors.Is(err, db.ErrNodeNotFoundRegistrationCache) {
-			httpUserError(writer, newHTTPUserError(
-				http.StatusGone,
-				registrationLinkSpentMsg,
-				registrationLinkSpentUserMsg,
-				err,
-			))
+	var content *bytes.Buffer
+
+	if authReq.IsSSHCheck() {
+		_, err := a.sshCheckSource(authID, authReq, user)
+		if err != nil {
+			httpUserError(writer, err)
 
 			return
 		}
 
-		httpUserError(writer, err)
+		authReq.FinishAuth(types.AuthVerdict{})
 
-		return
+		content = renderAuthSuccessTemplate(user)
+	} else {
+		_, reauth := a.h.state.LoginNode(
+			authReq.RegistrationData().MachineKey,
+			types.UserID(user.ID),
+		)
+
+		node, err := a.handleRegistration(user, authID, pending.NodeExpiry)
+		if err != nil {
+			if errors.Is(err, db.ErrNodeNotFoundRegistrationCache) {
+				httpUserError(writer, newHTTPUserError(
+					http.StatusGone,
+					registrationLinkSpentMsg,
+					registrationLinkSpentUserMsg,
+					err,
+				))
+
+				return
+			}
+
+			httpUserError(writer, err)
+
+			return
+		}
+
+		content = renderRegistrationSuccessTemplate(user, node, reauth)
 	}
 
-	// Clear the CSRF cookie now that the registration is final.
+	// Clear the CSRF cookie now that the request is final.
 	a.setRegisterConfirmCookie(writer, req, authID, "", -1)
-
-	content := renderRegistrationSuccessTemplate(user, newNode)
 
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
@@ -985,45 +1103,31 @@ func (a *AuthProviderOIDC) handleRegistration(
 	user *types.User,
 	registrationID types.AuthID,
 	expiry *time.Time,
-) (bool, error) {
+) (types.NodeView, error) {
 	node, nodeChange, err := a.h.state.HandleNodeFromAuthPath(
 		registrationID,
 		types.UserID(user.ID),
 		expiry,
 		util.RegisterMethodOIDC,
 	)
-	if err != nil {
-		a.h.Change(nodeChange)
-
-		return false, fmt.Errorf("registering node: %w", err)
-	}
-
-	// This is a bit of a back and forth, but we have a bit of a chicken and egg
-	// dependency here.
-	// Because the way the policy manager works, we need to have the node
-	// in the database, then add it to the policy manager and then we can
-	// approve the route. This means we get this dance where the node is
-	// first added to the database, then we add it to the policy manager via
-	// SaveNode (which automatically updates the policy manager) and then we can auto approve the routes.
-	// As that only approves the struct object, we need to save it again and
-	// ensure we send an update.
-	// This works, but might be another good candidate for doing some sort of
-	// eventbus.
-	routesChange, err := a.h.state.AutoApproveRoutes(node)
-
-	// Send both changes. Empty changes are ignored by Change().
-	a.h.Change(nodeChange, routesChange)
+	a.h.Change(nodeChange)
 
 	if err != nil {
-		return false, fmt.Errorf("auto approving routes: %w", err)
+		if errors.Is(err, types.ErrHostinfoTooLarge) {
+			return types.NodeView{}, newHTTPUserError(http.StatusBadRequest, "node report too large",
+				"This device reports too much data. Ask your administrator to reduce its reported metadata, then sign in again.", err)
+		}
+
+		return types.NodeView{}, fmt.Errorf("registering node: %w", err)
 	}
 
-	return !nodeChange.IsEmpty(), nil
+	return node, nil
 }
 
 func renderRegistrationSuccessTemplate(
 	user *types.User,
-	newNode bool,
+	node types.NodeView,
+	reauth bool,
 ) *bytes.Buffer {
 	result := templates.AuthSuccessResult{
 		Title:   "Headscale - Node Reauthenticated",
@@ -1032,7 +1136,11 @@ func renderRegistrationSuccessTemplate(
 		User:    user.Display(),
 		Message: "You can now close this window.",
 	}
-	if newNode {
+	if node.IsTagged() {
+		result.User = strings.Join(node.Tags().AsSlice(), ", ")
+	}
+
+	if !reauth {
 		result.Title = "Headscale - Node Registered"
 		result.Heading = "Node registered"
 		result.Verb = "Registered"
@@ -1081,9 +1189,8 @@ func (a *AuthProviderOIDC) setCSRFCookie(
 	w http.ResponseWriter,
 	r *http.Request,
 	name string,
-) string {
-	val := rands.HexString(64)
-
+	val string,
+) {
 	//nolint:gosec // G124: Secure from server_url scheme or req.TLS; HttpOnly + SameSite set below
 	c := &http.Cookie{
 		Path:     a.oidcCallbackPath(),
@@ -1100,6 +1207,4 @@ func (a *AuthProviderOIDC) setCSRFCookie(
 		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, c)
-
-	return val
 }

@@ -168,9 +168,9 @@ func TestNodeAttrsRevokesWhenRemoved(t *testing.T) {
 }
 
 // TestNodeAttrsBaselineCapsAlwaysOn verifies that the baseline caps
-// (Admin, SSH, FileSharing, DefaultAutoUpdate) are emitted on every
-// node regardless of whether the policy mentions them. Taildrive
-// (drive:share / drive:access) is policy-driven and is verified
+// (Admin, SSH, SSHEnvironmentVariables, FileSharing, DefaultAutoUpdate)
+// are emitted on every node regardless of whether the policy mentions them.
+// Taildrive (drive:share / drive:access) is policy-driven and is verified
 // through TestNodeAttrsAddsToBaseline and the integration
 // TestGrantCapDrive flow.
 func TestNodeAttrsBaselineCapsAlwaysOn(t *testing.T) {
@@ -189,6 +189,7 @@ func TestNodeAttrsBaselineCapsAlwaysOn(t *testing.T) {
 			for _, w := range []nodecap.Cap{
 				nodecap.Admin,
 				nodecap.SSH,
+				nodecap.SSHEnvironmentVariables,
 				nodecap.FileSharing,
 				nodecap.DefaultAutoUpdate,
 			} {
@@ -222,6 +223,36 @@ func TestTaildropDisabledWithholdsFileSharingCap(t *testing.T) {
 			return !hasCap(nm, nodecap.FileSharing) &&
 				hasCap(nm, nodecap.Admin) &&
 				hasCap(nm, nodecap.SSH)
+		})
+}
+
+// TestSSHBehaviorIsAnAdminChoice pins a deliberate difference from SaaS, which
+// stamps ssh-behavior-v1 on every node: headscale sends it only through a
+// nodeAttr, so sessions keep their login environment and PAM by default.
+func TestSSHBehaviorIsAnAdminChoice(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	user := srv.CreateUser(t, "ssh-behavior-user")
+
+	c := servertest.NewClient(t, srv, "ssh-behavior-node", servertest.WithUser(user))
+	c.WaitForCondition(t, "baseline without ssh-behavior-v1", 10*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			if nm == nil || !nm.SelfNode.Valid() {
+				return false
+			}
+
+			return hasCap(nm, nodecap.SSH) && !hasCap(nm, nodecap.SSHBehaviorV1)
+		})
+
+	reloadPolicy(t, srv, `{
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
+		"nodeAttrs": [{"target": ["*"], "attr": ["ssh-behavior-v1"]}]
+	}`)
+
+	c.WaitForCondition(t, "ssh-behavior-v1 through a nodeAttr", 10*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			return hasCap(nm, nodecap.SSHBehaviorV1)
 		})
 }
 

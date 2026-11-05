@@ -5,9 +5,13 @@ package mapper
 // handleNodeChange.
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -381,7 +385,7 @@ func TestBatcherRetryUsesCurrentPolicyAfterReconnect(t *testing.T) {
 }
 
 func TestBatcherUnreadyRetryRegeneratesRemovals(t *testing.T) {
-	testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 1, 2, 1)
+	testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 2, 1, 1)
 	defer cleanup()
 
 	b := NewBatcher(time.Hour, 1, testData.Batcher.mapper)
@@ -877,7 +881,7 @@ func TestAddToBatch_NodeRemovedStopsSession(t *testing.T) {
 	mc.connections[0].stop = func() { close(stopped) }
 	mc.mutex.Unlock()
 
-	lb.b.AddWork(change.NodeRemoved(1))
+	lb.b.AddWork(change.NodeRemoved(1)...)
 
 	// addToBatch runs synchronously, so the session must already be stopped.
 	select {
@@ -1450,28 +1454,18 @@ func TestMultiChannelSend_ConcurrentRemoveAndSend(t *testing.T) {
 func TestBatcher_CloseWaitsForWorkers(t *testing.T) {
 	b := NewBatcher(50*time.Millisecond, 4, nil)
 
-	goroutinesBefore := runtime.NumGoroutine()
+	startLabelled(b, t.Name())
 
-	b.Start()
-
-	// Give workers time to start.
-	time.Sleep(20 * time.Millisecond) //nolint:forbidigo // test timing
-
-	goroutinesDuring := runtime.NumGoroutine()
-
-	// We expect at least 5 new goroutines: 1 doWork + 4 workers.
-	assert.GreaterOrEqual(t, goroutinesDuring-goroutinesBefore, 5,
-		"expected doWork + 4 workers to be running")
+	// 1 doWork + 4 workers.
+	require.Eventually(t, func() bool {
+		return batcherGoroutines(t.Name()) == 5
+	}, time.Second, 5*time.Millisecond, "expected doWork + 4 workers to be running")
 
 	// Close should block until all workers have exited.
 	b.Close()
 
-	// After Close returns, goroutines should have dropped back.
-	// Allow a small margin for runtime goroutines.
-	goroutinesAfter := runtime.NumGoroutine()
-	assert.InDelta(t, goroutinesBefore, goroutinesAfter, 3,
-		"goroutines should return to baseline after Close(); before=%d after=%d",
-		goroutinesBefore, goroutinesAfter)
+	assert.Zero(t, batcherGoroutines(t.Name()),
+		"batcher goroutines still running after Close()")
 }
 
 // TestBatcher_CloseThenStartIsNoop verifies the lifecycle contract:
@@ -1480,22 +1474,52 @@ func TestBatcher_CloseWaitsForWorkers(t *testing.T) {
 func TestBatcher_CloseThenStartIsNoop(t *testing.T) {
 	b := NewBatcher(50*time.Millisecond, 2, nil)
 
-	b.Start()
+	startLabelled(b, t.Name())
 	b.Close()
 
-	goroutinesBefore := runtime.NumGoroutine()
-
 	// Second Start should be a no-op because started is already true.
-	b.Start()
+	startLabelled(b, t.Name())
 
 	// Allow a moment for any hypothetical goroutine to appear.
 	<-time.After(10 * time.Millisecond) //nolint:forbidigo // test timing
 
-	goroutinesAfter := runtime.NumGoroutine()
+	assert.Zero(t, batcherGoroutines(t.Name()),
+		"Start() after Close() should not spawn new goroutines")
+}
 
-	assert.InDelta(t, goroutinesBefore, goroutinesAfter, 1,
-		"Start() after Close() should not spawn new goroutines; before=%d after=%d",
-		goroutinesBefore, goroutinesAfter)
+// startLabelled starts b under a pprof label that its goroutines inherit, so
+// batcherGoroutines counts them and nothing else.
+func startLabelled(b *Batcher, label string) {
+	pprof.Do(context.Background(), pprof.Labels("batcher", label), func(context.Context) {
+		b.Start()
+	})
+}
+
+// batcherGoroutines counts goroutines in Batcher code started by startLabelled
+// with label. A runtime.NumGoroutine delta also moves when goroutines other
+// tests left behind exit.
+func batcherGoroutines(label string) int {
+	var buf bytes.Buffer
+
+	_ = pprof.Lookup("goroutine").WriteTo(&buf, 1)
+
+	want := fmt.Sprintf(`"batcher":%q`, label)
+	total := 0
+
+	for group := range strings.SplitSeq(buf.String(), "\n\n") {
+		if !strings.Contains(group, want) || !strings.Contains(group, ".(*Batcher).") {
+			continue
+		}
+
+		for line := range strings.Lines(group) {
+			if n, _, ok := strings.Cut(line, " @ "); ok {
+				c, _ := strconv.Atoi(n)
+				total += c
+			}
+		}
+	}
+
+	return total
 }
 
 // TestBatcher_CloseStopsTicker verifies that Close() stops the internal
@@ -1631,6 +1655,34 @@ func TestRemoveConnectionAtIndex_NilsTrailingSlot(t *testing.T) {
 	mc.mutex.Unlock()
 }
 
+// A node chooses how many map streams it opens and each pins a session, so
+// past the limit a new connection replaces the oldest.
+func TestAddConnectionWithLimit_StopsOldest(t *testing.T) {
+	mc := newMultiChannelNodeConn(1, nil)
+
+	var stopped []int
+
+	for i := range maxConcurrentMapSessionsPerNode + 3 {
+		entry := makeConnectionEntry(
+			fmt.Sprintf("conn-%d", i),
+			make(chan *tailcfg.MapResponse, 1),
+		)
+		entry.stop = func() { stopped = append(stopped, i) }
+		mc.addConnectionWithLimit(entry, maxConcurrentMapSessionsPerNode)
+	}
+
+	assert.Equal(t, maxConcurrentMapSessionsPerNode, mc.getActiveConnectionCount())
+	assert.Equal(t, []int{0, 1, 2}, stopped,
+		"the oldest connections should be stopped, each once")
+
+	// The newest connections are the ones kept, in arrival order.
+	mc.mutex.RLock()
+	assert.Equal(t, "conn-3", mc.connections[0].id)
+	assert.Equal(t, fmt.Sprintf("conn-%d", maxConcurrentMapSessionsPerNode+2),
+		mc.connections[len(mc.connections)-1].id)
+	mc.mutex.RUnlock()
+}
+
 // ============================================================================
 // SSHPolicy delta Tests
 // ============================================================================
@@ -1706,6 +1758,7 @@ func TestMultiChannelSend_SSHPolicyPerConnection(t *testing.T) {
 	mc.addConnection(b)
 
 	data := testMapResponse()
+	data.Domain = "example.com"
 	data.SSHPolicy = sshPolicyForUser("alice")
 
 	require.NoError(t, mc.send(data))
@@ -1715,7 +1768,7 @@ func TestMultiChannelSend_SSHPolicyPerConnection(t *testing.T) {
 }
 
 func TestPartialPeerAdditionThenRevocation(t *testing.T) {
-	td, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 1, 2, 1)
+	td, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 2, 1, 1)
 	defer cleanup()
 
 	_, err := td.State.SetPolicy([]byte(`{"acls":[]}`))
@@ -1756,6 +1809,26 @@ func TestPartialPeerAdditionThenRevocation(t *testing.T) {
 	b.processBatchedChanges()
 	require.Eventually(t, func() bool { return !nc.inFlight.Load() }, time.Second, time.Millisecond)
 	require.Equal(t, []tailcfg.NodeID{peer}, expectReceive(t, fast, "revocation must remove partially delivered peer").PeersRemoved)
+}
+
+// TestSendSkipsResponseLeftEmptyByStripping: a stream that holds this Node and
+// SSHPolicy already has nothing to read, so it gets no frame.
+func TestSendSkipsResponseLeftEmptyByStripping(t *testing.T) {
+	mc := newMultiChannelNodeConn(1, nil)
+	ch := make(chan *tailcfg.MapResponse, 2)
+	mc.addConnection(makeConnectionEntry("stream", ch))
+
+	now := time.Now()
+	self := &tailcfg.Node{ID: 1}
+	ssh := &tailcfg.SSHPolicy{}
+	frame := &tailcfg.MapResponse{ControlTime: &now, Node: self, SSHPolicy: ssh}
+
+	require.NoError(t, mc.send(frame))
+	require.Len(t, ch, 1)
+	<-ch
+
+	require.NoError(t, mc.send(frame))
+	require.Empty(t, ch, "nothing new for this stream")
 }
 
 func TestEmptyMapResponse(t *testing.T) {

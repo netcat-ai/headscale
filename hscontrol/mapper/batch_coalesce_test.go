@@ -88,7 +88,8 @@ func TestAppendPendingStaysBoundedWhileInFlight(t *testing.T) {
 
 		cs := []change.Change{change.NodeAdded(peer), change.NodeOnline(peer), change.PolicyChange()}
 		if i%100 == 0 {
-			cs = append(cs, change.NodeRemoved(types.NodeID(i+1000))) //nolint:gosec // test
+			// The removal this node gets as a peer of the deleted one.
+			cs = append(cs, change.NodeRemoved(types.NodeID(i+1000), id)[1]) //nolint:gosec // test
 		}
 
 		for _, c := range cs {
@@ -124,7 +125,7 @@ func TestAppendPendingBoundsFoldedPatches(t *testing.T) {
 		if i%2 == 0 {
 			nc.appendPending(change.NodeOnline(2))
 		} else {
-			nc.appendPending(change.NodeOffline(2))
+			nc.appendPending(change.NodeOffline(2, time.Time{}))
 		}
 	}
 

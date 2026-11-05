@@ -14,7 +14,7 @@
 //     + ReduceFilterRules) against golden file captures.
 //
 //   - TestRoutesCompatPeerVisibility: validates peer visibility (CanAccess)
-//     for the subnet-to-subnet scenarios (f10–f15). These tests
+//     for the subnet-to-subnet scenarios (f10–f15, m6). These tests
 //     derive expected peer relationships from the golden file captures: if
 //     Tailscale SaaS delivers filter rules to a node, then the subnet routers
 //     referenced in those rules must be visible as peers. This exercises the
@@ -26,7 +26,10 @@
 package v2
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/fs"
+	"net/http"
 	"net/netip"
 	"path/filepath"
 	"slices"
@@ -39,10 +42,15 @@ import (
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tailscale/hujson"
 	"go4.org/netipx"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 )
 
 // loadRoutesTestFile loads and parses a single routes capture HuJSON file.
@@ -170,6 +178,110 @@ func buildRoutesUsersAndNodes(
 	return users, nodes
 }
 
+// routesSkipReasons lists checks where headscale differs from SaaS, keyed
+// <test_id>/<node>/<check>. A listed check that matches fails, so a fix must
+// delete its entry.
+var routesSkipReasons = map[string]string{
+	// SaaS lists contiguous source addresses one by one; headscale merges
+	// them into ranges.
+	"routes-m2-member-partial-subnet/r-exit/filter":  filterAddressForm,
+	"routes-m2-member-partial-subnet/r-multi/filter": filterAddressForm,
+	"routes-m4-member-self/m-odin1/filter":           filterAddressForm,
+	"routes-m4-member-self/m-odin2/filter":           filterAddressForm,
+	"routes-m4-member-self/r-exit/filter":            "FILTER_ADDRESS_FORM: same addresses, different wire form and rule order",
+}
+
+// routesNotCompared lists, by key prefix, checks left out: SaaS's answer
+// there is in doubt, so it is no reference.
+var routesNotCompared = []string{
+	"routes-t1-auto-v4-default/ovl-r-ctrl/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-host4/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-host6/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-mapped/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-narrow/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-via/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-wide-in/peer-allowed-ips",
+	"routes-t2-auto-v6-default/ovl-r-ctrl/peer-allowed-ips",
+	"routes-t2-auto-v6-default/ovl-r-host4/peer-allowed-ips",
+	"routes-t2-auto-v6-default/ovl-r-host6/peer-allowed-ips",
+	"routes-t2-auto-v6-default/ovl-r-mapped/peer-allowed-ips",
+	"routes-t2-auto-v6-default/ovl-r-narrow/peer-allowed-ips",
+	"routes-t2-auto-v6-default/ovl-r-via/peer-allowed-ips",
+	"routes-t3-auto-narrow-keys/ovl-r-ctrl/peer-allowed-ips",
+	"routes-t3-auto-narrow-keys/ovl-r-host4/peer-allowed-ips",
+	"routes-t3-auto-narrow-keys/ovl-r-host6/peer-allowed-ips",
+	"routes-t3-auto-narrow-keys/ovl-r-mapped/peer-allowed-ips",
+	"routes-t3-auto-narrow-keys/ovl-r-narrow/peer-allowed-ips",
+	"routes-t3-auto-narrow-keys/ovl-r-via/peer-allowed-ips",
+	"routes-t4-admin/ovl-r-ctrl/peer-allowed-ips",
+	"routes-t4-admin/ovl-r-host4/peer-allowed-ips",
+	"routes-t4-admin/ovl-r-host6/peer-allowed-ips",
+	"routes-t4-admin/ovl-r-mapped/peer-allowed-ips",
+	"routes-t4-admin/ovl-r-narrow/peer-allowed-ips",
+	"routes-t4-admin/ovl-r-via/peer-allowed-ips",
+	"routes-t5-oauth-routes-scope/ovl-r-ctrl/peer-allowed-ips",
+	"routes-t5-oauth-routes-scope/ovl-r-host4/peer-allowed-ips",
+	"routes-t5-oauth-routes-scope/ovl-r-host6/peer-allowed-ips",
+	"routes-t5-oauth-routes-scope/ovl-r-mapped/peer-allowed-ips",
+	"routes-t5-oauth-routes-scope/ovl-r-narrow/peer-allowed-ips",
+	"routes-t5-oauth-routes-scope/ovl-r-via/peer-allowed-ips",
+	"routes-t1-auto-v4-default/ovl-r-ctrl/peers",
+	"routes-t1-auto-v4-default/ovl-r-host4/peers",
+	"routes-t1-auto-v4-default/ovl-r-host6/peers",
+	"routes-t1-auto-v4-default/ovl-r-mapped/peers",
+	"routes-t1-auto-v4-default/ovl-r-narrow/peers",
+	"routes-t1-auto-v4-default/ovl-r-via/peers",
+	"routes-t1-auto-v4-default/ovl-r-wide-in/peers",
+	"routes-t2-auto-v6-default/ovl-r-ctrl/peers",
+	"routes-t2-auto-v6-default/ovl-r-host4/peers",
+	"routes-t2-auto-v6-default/ovl-r-host6/peers",
+	"routes-t2-auto-v6-default/ovl-r-mapped/peers",
+	"routes-t2-auto-v6-default/ovl-r-narrow/peers",
+	"routes-t2-auto-v6-default/ovl-r-via/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-ctrl/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-host4/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-host6/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-mapped/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-narrow/peers",
+	"routes-t3-auto-narrow-keys/ovl-r-via/peers",
+	"routes-t4-admin/ovl-r-ctrl/peers",
+	"routes-t4-admin/ovl-r-host4/peers",
+	"routes-t4-admin/ovl-r-host6/peers",
+	"routes-t4-admin/ovl-r-mapped/peers",
+	"routes-t4-admin/ovl-r-narrow/peers",
+	"routes-t4-admin/ovl-r-via/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-ctrl/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-host4/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-host6/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-mapped/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-narrow/peers",
+	"routes-t5-oauth-routes-scope/ovl-r-via/peers",
+}
+
+// notCompared reports whether key falls under one of prefixes.
+func notCompared(prefixes []string, key string) bool {
+	return slices.ContainsFunc(prefixes, func(p string) bool {
+		return strings.HasPrefix(key, p)
+	})
+}
+
+const filterAddressForm = "FILTER_ADDRESS_FORM: same addresses, different wire form"
+
+// routesSetByAPI reports whether the capture's routes were approved through
+// the routes API rather than by the policy.
+func routesSetByAPI(c *testcapture.Capture) bool {
+	for _, step := range c.Steps {
+		for _, a := range step.Actions {
+			if a.Kind == "api" && a.Method == http.MethodPost &&
+				strings.HasSuffix(a.Path, "/routes") && a.Status == http.StatusOK {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // subnetToSubnetFiles lists the golden files that test subnet-to-subnet
 // ACL scenarios. These are the scenarios where the fix for issue #3157
 // (CanAccess considering subnet routes as source identity) is critical.
@@ -180,6 +292,7 @@ var subnetToSubnetFiles = []string{
 	"routes-f13-subnet-to-subnet-disjoint",
 	"routes-f14-subnet-to-subnet-overlapping-one-router",
 	"routes-f15-subnet-to-subnet-cross-routers",
+	"routes-m6-subnet-to-subnet-multi-route",
 }
 
 // TestRoutesCompat is a data-driven test that loads all routes-*.hujson test
@@ -244,6 +357,7 @@ func TestRoutesCompat(t *testing.T) {
 					gotRules := policyutil.ReduceFilterRules(
 						node.View(),
 						compiledRules,
+						nodeAddrSet(nodes.ViewSlice()),
 					)
 
 					wantRules := capture.PacketFilterRules
@@ -252,22 +366,88 @@ func TestRoutesCompat(t *testing.T) {
 						cmpOptions(),
 						cmpopts.EquateEmpty(),
 					)
-					if diff := cmp.Diff(
-						wantRules,
-						gotRules,
-						opts...,
-					); diff != "" {
-						t.Errorf(
-							"%s/%s: filter rules mismatch (-want +got):\n%s",
-							tf.TestID,
-							nodeName,
-							diff,
+
+					compatCheck(t, routesSkipReasons, tf.TestID+"/"+nodeName+"/filter", func() string {
+						return cmp.Diff(
+							expandFilterDestinationRanges(t, wantRules),
+							expandFilterDestinationRanges(t, gotRules),
+							opts...,
 						)
-					}
+					})
 				})
 			}
 		})
 	}
+}
+
+// Expand ranges per destination so ports, protocols, rule boundaries and duplicates stay intact.
+func expandFilterDestinationRanges(t *testing.T, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+	t.Helper()
+
+	expanded := slices.Clone(rules)
+
+	for i, rule := range rules {
+		if !slices.ContainsFunc(rule.DstPorts, func(dst tailcfg.NetPortRange) bool {
+			return strings.Contains(dst.IP, "-")
+		}) {
+			continue
+		}
+
+		var dests []tailcfg.NetPortRange
+
+		for _, dst := range rule.DstPorts {
+			if !strings.Contains(dst.IP, "-") {
+				dests = append(dests, dst)
+
+				continue
+			}
+
+			set, err := util.ParseIPSet(dst.IP, nil)
+			require.NoErrorf(t, err, "golden DstPorts.IP %q unparseable", dst.IP)
+
+			for _, prefix := range set.Prefixes() {
+				dest := dst
+				dest.IP = filterIP(prefix)
+				dests = append(dests, dest)
+			}
+		}
+
+		expanded[i].DstPorts = dests
+	}
+
+	return expanded
+}
+
+func TestExpandFilterDestinationRanges(t *testing.T) {
+	rules := []tailcfg.FilterRule{{
+		SrcIPs:  []string{"100.64.0.1"},
+		IPProto: []int{6, 17},
+		DstPorts: []tailcfg.NetPortRange{
+			{IP: "192.0.2.1-192.0.2.2", Ports: tailcfg.PortRange{First: 80, Last: 80}},
+			{IP: "192.0.2.1-192.0.2.2", Ports: tailcfg.PortRange{First: 443, Last: 443}},
+			{IP: "192.0.2.1-192.0.2.2", Ports: tailcfg.PortRange{First: 80, Last: 80}},
+			{IP: "203.0.113.4", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+		},
+	}, {
+		SrcIPs: []string{"100.64.0.2"},
+		DstPorts: []tailcfg.NetPortRange{
+			{IP: "192.0.2.1", Ports: tailcfg.PortRangeAny},
+		},
+	}}
+	before := slices.Clone(rules[0].DstPorts)
+	want := slices.Clone(rules)
+	want[0].DstPorts = []tailcfg.NetPortRange{
+		{IP: "192.0.2.1", Ports: tailcfg.PortRange{First: 80, Last: 80}},
+		{IP: "192.0.2.2", Ports: tailcfg.PortRange{First: 80, Last: 80}},
+		{IP: "192.0.2.1", Ports: tailcfg.PortRange{First: 443, Last: 443}},
+		{IP: "192.0.2.2", Ports: tailcfg.PortRange{First: 443, Last: 443}},
+		{IP: "192.0.2.1", Ports: tailcfg.PortRange{First: 80, Last: 80}},
+		{IP: "192.0.2.2", Ports: tailcfg.PortRange{First: 80, Last: 80}},
+		{IP: "203.0.113.4", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+	}
+
+	require.Equal(t, want, expandFilterDestinationRanges(t, rules))
+	require.Equal(t, before, rules[0].DstPorts)
 }
 
 // derivePeerPairsFromCaptures builds the set of expected peer pairs from
@@ -716,6 +896,10 @@ func TestRoutesCompatAutoApproval(t *testing.T) {
 		t.Run(tf.TestID, func(t *testing.T) {
 			t.Parallel()
 
+			if routesSetByAPI(tf) {
+				t.Skip("routes approved through the routes API, not by autoApprovers")
+			}
+
 			// Build topology from JSON.
 			users, nodes := buildRoutesUsersAndNodes(t, tf.Topology)
 
@@ -868,17 +1052,13 @@ func TestRoutesCompatReduceRoutes(t *testing.T) {
 							continue
 						}
 
-						prefix, parseErr := netip.ParsePrefix(dp.IP)
-						if parseErr != nil {
-							addr, addrErr := netip.ParseAddr(dp.IP)
-							require.NoErrorf(t, addrErr,
-								"golden DstPorts.IP %q unparseable", dp.IP)
+						set, err := util.ParseIPSet(dp.IP, nil)
+						require.NoErrorf(t, err, "golden DstPorts.IP %q unparseable", dp.IP)
 
-							prefix = netip.PrefixFrom(addr, addr.BitLen())
-						}
-
-						if !slices.Contains(dstPrefixes, prefix) {
-							dstPrefixes = append(dstPrefixes, prefix)
+						for _, prefix := range set.Prefixes() {
+							if !slices.Contains(dstPrefixes, prefix) {
+								dstPrefixes = append(dstPrefixes, prefix)
+							}
 						}
 					}
 
@@ -1448,9 +1628,16 @@ func TestRoutesCompatPeerAllowedIPs(t *testing.T) {
 					continue
 				}
 
+				key := tf.TestID + "/" + viewerName + "/peer-allowed-ips"
+				if notCompared(routesNotCompared, key) {
+					continue
+				}
+
 				t.Run(viewerName, func(t *testing.T) {
 					matchers, err := pm.MatchersForNode(viewer.View())
 					require.NoError(t, err)
+
+					var want, got []string
 
 					for _, nmPeer := range capture.Netmap.Peers {
 						// Extract the short name from the FQDN.
@@ -1487,15 +1674,13 @@ func TestRoutesCompatPeerAllowedIPs(t *testing.T) {
 						slices.SortFunc(gotAllowedIPs, netip.Prefix.Compare)
 
 						wantAllowedIPs := nmPeer.AllowedIPs().AsSlice()
-						slices.SortFunc(wantAllowedIPs, netip.Prefix.Compare)
 
-						assert.Equalf(t,
-							prefixStrings(wantAllowedIPs),
-							prefixStrings(gotAllowedIPs),
-							"%s/%s: peer %s AllowedIPs mismatch",
-							tf.TestID, viewerName, peerName,
-						)
+						want = append(want, fmt.Sprintf("%s: %v", peerName, prefixStrings(wantAllowedIPs)))
+						got = append(got, fmt.Sprintf("%s: %v", peerName, prefixStrings(gotAllowedIPs)))
 					}
+
+					compatCheck(t, routesSkipReasons, key,
+						func() string { return cmp.Diff(want, got) })
 				})
 			}
 		})
@@ -1504,6 +1689,78 @@ func TestRoutesCompatPeerAllowedIPs(t *testing.T) {
 	require.Positive(t, testedFiles,
 		"no golden files with netmap data found — test is vacuous",
 	)
+}
+
+// TestRoutesCompatPeerMap checks that BuildPeerMap gives each captured node
+// exactly the topology nodes SaaS listed as its peers.
+func TestRoutesCompatPeerMap(t *testing.T) {
+	t.Parallel()
+
+	files, err := filepath.Glob(
+		filepath.Join("testdata", "routes_results", "routes-*.hujson"),
+	)
+	require.NoError(t, err, "failed to glob test files")
+	require.NotEmpty(t, files)
+
+	for _, file := range files {
+		tf := loadRoutesTestFile(t, file)
+		if tf.Error {
+			continue
+		}
+
+		t.Run(tf.TestID, func(t *testing.T) {
+			t.Parallel()
+
+			users, nodes := buildRoutesUsersAndNodes(t, tf.Topology)
+			policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
+
+			pm, err := NewPolicyManager(policyJSON, users, nodes.ViewSlice())
+			require.NoError(t, err, "%s: failed to create policy manager", tf.TestID)
+
+			names := make(map[types.NodeID]string, len(nodes))
+			for _, n := range nodes {
+				names[n.ID] = n.GivenName
+			}
+
+			peerMap := pm.BuildPeerMap(nodes.ViewSlice())
+
+			for viewerName, capture := range tf.Captures {
+				if capture.Netmap == nil {
+					continue
+				}
+
+				viewer := findNodeByGivenName(nodes, viewerName)
+				require.NotNilf(t, viewer, "golden node %s not found in topology", viewerName)
+
+				key := tf.TestID + "/" + viewerName + "/peers"
+				if notCompared(routesNotCompared, key) {
+					continue
+				}
+
+				t.Run(viewerName, func(t *testing.T) {
+					want := []string{}
+
+					for _, p := range capture.Netmap.Peers {
+						name, _, _ := strings.Cut(p.Name(), ".")
+						if findNodeByGivenName(nodes, name) != nil {
+							want = append(want, name)
+						}
+					}
+
+					got := []string{}
+					for _, id := range peerMap[viewer.ID] {
+						got = append(got, names[id])
+					}
+
+					slices.Sort(want)
+					slices.Sort(got)
+
+					compatCheck(t, routesSkipReasons, key,
+						func() string { return cmp.Diff(want, got) })
+				})
+			}
+		})
+	}
 }
 
 // TestRoutesCompatPeerCapMap validates the peer-view CapMap against SaaS
@@ -1638,4 +1895,359 @@ func assertRoutesErrorContains(
 		wantMsg,
 		errStr,
 	)
+}
+
+// TestCapturesAgreeOnRoutes holds every capture to itself. The capture tool
+// reads the topology and each node's netmap seconds apart, and an approval can
+// land or reach a viewer in between, so a capture can straddle it. The compat
+// tests would then replay a router with no routes against a netmap holding them.
+func TestCapturesAgreeOnRoutes(t *testing.T) {
+	t.Parallel()
+
+	var files []string
+
+	err := filepath.WalkDir("testdata", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !d.IsDir() && filepath.Ext(path) == ".hujson" {
+			files = append(files, path)
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+
+	routes := func(n tailcfg.NodeView) []string {
+		var out []string
+
+		for _, pfx := range n.AllowedIPs().All() {
+			if !views.SliceContains(n.Addresses(), pfx) {
+				out = append(out, pfx.String())
+			}
+		}
+
+		return out
+	}
+
+	for _, file := range files {
+		t.Run(strings.TrimSuffix(filepath.Base(file), ".hujson"), func(t *testing.T) {
+			t.Parallel()
+
+			c, err := testcapture.Read(file)
+			require.NoError(t, err)
+			assert.Empty(t, c.CaptureError, "the capture tool reported a failure")
+
+			if len(c.Captures) == 0 {
+				require.Truef(t, slices.ContainsFunc(c.Steps, func(s testcapture.Step) bool { return s.Name == "validate" }),
+					"no node was captured and no step says that was the intent")
+				t.Skip("validation only, no node was asked for its state")
+			}
+
+			assert.Len(t, c.Captures, len(c.Topology.Nodes), "captures against the topology")
+
+			if !c.Error {
+				for name, topo := range c.Topology.Nodes {
+					assert.Subsetf(t, topo.ApprovedRoutes, tagApprovedRoutes(t, c.Input.FullPolicy, topo),
+						"%s: the policy approves routes the capture does not", name)
+				}
+			}
+
+			for name, topo := range c.Topology.Nodes {
+				node, captured := c.Captures[name]
+				if !assert.Truef(t, captured, "%s is in the topology but was not captured", name) {
+					continue
+				}
+
+				if !assert.Truef(t, node.Netmap != nil && node.Netmap.SelfNode.Valid(),
+					"%s was captured without its own netmap", name) {
+					continue
+				}
+
+				assert.ElementsMatchf(t, topo.ApprovedRoutes, routes(node.Netmap.SelfNode),
+					"%s: approved routes against its own netmap", name)
+
+				// The lag check below reads the filter, which is read apart
+				// from the netmap.
+				assert.Emptyf(t, cmp.Diff(node.PacketFilterRules, node.Netmap.PacketFilterRules.AsSlice(), append(cmpOptions(), cmpopts.EquateEmpty())...),
+					"%s: its filter against the one in its netmap", name)
+
+				for _, peer := range node.Netmap.Peers {
+					peerName := peer.ComputedName()
+
+					owner, known := c.Topology.Nodes[peerName]
+					if !assert.Truef(t, known, "%s has a peer outside the topology: %s", name, peerName) {
+						continue
+					}
+
+					seen := routes(peer)
+					assert.Subsetf(t, owner.ApprovedRoutes, seen,
+						"%s sees routes on %s that it does not hold", name, peerName)
+
+					// A policy can hide a route, but not one the filters use.
+					for _, route := range routesViewerMustSee(t, node, c.Captures[peerName], owner, c.Topology) {
+						assert.Containsf(t, seen, route, "%s lags: %s holds a route the filters give it", name, peerName)
+					}
+				}
+			}
+		})
+	}
+}
+
+// tagApprovedRoutes lists the routes node advertises that policy's
+// autoApprovers grant to one of its tags. It reads the policy itself, so that
+// the capture check does not lean on the approval code the replays test.
+func tagApprovedRoutes(t *testing.T, policy string, node testcapture.TopologyNode) []string {
+	t.Helper()
+
+	std, err := hujson.Standardize([]byte(policy))
+	require.NoError(t, err)
+
+	var pol struct {
+		AutoApprovers struct {
+			Routes   map[string][]string `json:"routes"`
+			ExitNode []string            `json:"exitNode"`
+		} `json:"autoApprovers"`
+	}
+
+	require.NoError(t, json.Unmarshal(std, &pol))
+
+	hasTag := func(approvers []string) bool {
+		return slices.ContainsFunc(approvers, func(a string) bool { return slices.Contains(node.Tags, a) })
+	}
+
+	var out []string
+
+	for _, advertised := range node.RoutableIPs {
+		route, err := netip.ParsePrefix(advertised)
+		require.NoError(t, err)
+
+		approved := route.Bits() == 0 && hasTag(pol.AutoApprovers.ExitNode)
+
+		for covering, approvers := range pol.AutoApprovers.Routes {
+			pfx, err := netip.ParsePrefix(covering)
+			require.NoError(t, err)
+
+			if route.Bits() > 0 && pfx.Bits() <= route.Bits() && pfx.Contains(route.Addr()) && hasTag(approvers) {
+				approved = true
+			}
+		}
+
+		if approved {
+			out = append(out, advertised)
+		}
+	}
+
+	return out
+}
+
+// routesViewerMustSee lists the owner's subnet routes that a viewer's netmap
+// has to show: those the owner's filter admits the viewer to, and those the
+// viewer's own filter admits traffic from. A route with more than one approver
+// is left out, as only its primary shows it, and so is one inside the tailnet's
+// own ranges, which TestRoutesTailnetOverlapCompat covers.
+func routesViewerMustSee(
+	t *testing.T,
+	viewer, owner testcapture.Node,
+	ownerTopo testcapture.TopologyNode,
+	topo testcapture.Topology,
+) []string {
+	t.Helper()
+
+	if viewer.Netmap == nil || !viewer.Netmap.SelfNode.Valid() {
+		return nil
+	}
+
+	overlaps := func(cidrs []string, route netip.Prefix) bool {
+		return slices.ContainsFunc(cidrs, func(cidr string) bool {
+			set, err := util.ParseIPSet(cidr, nil)
+			require.NoError(t, err)
+
+			return set.OverlapsPrefix(route)
+		})
+	}
+
+	var out []string
+
+	for _, approved := range ownerTopo.ApprovedRoutes {
+		route, err := netip.ParsePrefix(approved)
+		require.NoError(t, err)
+
+		approvers := 0
+
+		for _, node := range topo.Nodes {
+			if slices.Contains(node.ApprovedRoutes, approved) {
+				approvers++
+			}
+		}
+
+		if route.Bits() == 0 || approvers > 1 || tsaddr.CGNATRange().Overlaps(route) ||
+			tsaddr.TailscaleULARange().Overlaps(route) || tsaddr.CGNATRange().Contains(route.Addr().Unmap()) {
+			continue
+		}
+
+		admitted := slices.ContainsFunc(owner.PacketFilterRules, func(rule tailcfg.FilterRule) bool {
+			return slices.ContainsFunc(viewer.Netmap.SelfNode.Addresses().AsSlice(), func(addr netip.Prefix) bool {
+				return overlaps(rule.SrcIPs, addr)
+			}) && slices.ContainsFunc(rule.DstPorts, func(dst tailcfg.NetPortRange) bool {
+				return overlaps([]string{dst.IP}, route)
+			})
+		})
+
+		sourced := slices.ContainsFunc(viewer.PacketFilterRules, func(rule tailcfg.FilterRule) bool {
+			return !slices.Contains(rule.SrcIPs, "*") && overlaps(rule.SrcIPs, route)
+		})
+
+		if admitted || sourced {
+			out = append(out, approved)
+		}
+	}
+
+	return out
+}
+
+func TestRoutesViewerMustSee(t *testing.T) {
+	t.Parallel()
+
+	const (
+		viewerAddr = "100.64.0.1"
+		route      = "10.33.0.0/16"
+	)
+
+	viewer := func(rules ...tailcfg.FilterRule) testcapture.Node {
+		return testcapture.Node{
+			PacketFilterRules: rules,
+			Netmap: &netmap.NetworkMap{SelfNode: (&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix(viewerAddr + "/32")},
+			}).View()},
+		}
+	}
+
+	allow := func(src, dst string) tailcfg.FilterRule {
+		return tailcfg.FilterRule{SrcIPs: []string{src}, DstPorts: []tailcfg.NetPortRange{{IP: dst, Ports: tailcfg.PortRangeAny}}}
+	}
+
+	tests := []struct {
+		name     string
+		viewer   testcapture.Node
+		owner    testcapture.Node
+		approved []string
+		others   int
+		want     []string
+	}{
+		{
+			name:     "the router's filter admits the viewer",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow(viewerAddr, route)}},
+			approved: []string{route},
+			want:     []string{route},
+		},
+		{
+			name:     "the router's filter admits someone else",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow("100.64.0.2", route)}},
+			approved: []string{route},
+		},
+		{
+			name:     "the router's filter admits the viewer elsewhere",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow(viewerAddr, "10.99.0.0/16")}},
+			approved: []string{route},
+		},
+		{
+			name:     "the viewer's filter admits traffic from the route",
+			viewer:   viewer(allow(route, viewerAddr)),
+			approved: []string{route},
+			want:     []string{route},
+		},
+		{
+			name:     "a wildcard source says nothing of the route",
+			viewer:   viewer(allow("*", viewerAddr)),
+			approved: []string{route},
+		},
+		{
+			name:     "two routers hold it, so only the primary shows it",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow(viewerAddr, route)}},
+			approved: []string{route},
+			others:   1,
+		},
+		{
+			name:     "exit routes are not subnet routes",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow(viewerAddr, "*")}},
+			approved: []string{"0.0.0.0/0", "::/0"},
+		},
+		{
+			name:     "a route inside the tailnet's range",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow(viewerAddr, "100.64.0.11/32")}},
+			approved: []string{"100.64.0.11/32"},
+		},
+		{
+			name:     "an IPv4-mapped route inside the tailnet's range",
+			viewer:   viewer(),
+			owner:    testcapture.Node{PacketFilterRules: []tailcfg.FilterRule{allow(viewerAddr, "::ffff:100.64.0.11/128")}},
+			approved: []string{"::ffff:100.64.0.11/128"},
+		},
+		{
+			name:     "a viewer with no netmap",
+			approved: []string{route},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			owner := testcapture.TopologyNode{ApprovedRoutes: tt.approved}
+			topo := testcapture.Topology{Nodes: map[string]testcapture.TopologyNode{"owner": owner}}
+
+			for i := range tt.others {
+				topo.Nodes[fmt.Sprintf("other-%d", i)] = owner
+			}
+
+			assert.Equal(t, tt.want, routesViewerMustSee(t, tt.viewer, tt.owner, owner, topo))
+		})
+	}
+}
+
+func TestTagApprovedRoutes(t *testing.T) {
+	t.Parallel()
+
+	const policy = `{
+		// A comment, as a policy file can hold.
+		"autoApprovers": {
+			"routes": {"10.0.0.0/8": ["tag:router"], "192.168.0.0/24": ["alice@example.com"]},
+			"exitNode": ["tag:exit"],
+		},
+	}`
+
+	node := func(routes []string, tags ...string) testcapture.TopologyNode {
+		return testcapture.TopologyNode{RoutableIPs: routes, Tags: tags}
+	}
+
+	tests := []struct {
+		name string
+		node testcapture.TopologyNode
+		want []string
+	}{
+		{"a wider approver covers it", node([]string{"10.33.0.0/16"}, "tag:router"), []string{"10.33.0.0/16"}},
+		{"another tag", node([]string{"10.33.0.0/16"}, "tag:other"), nil},
+		{"a route the approver does not cover", node([]string{"172.16.0.0/12"}, "tag:router"), nil},
+		{"a route wider than the approver", node([]string{"10.0.0.0/7"}, "tag:router"), nil},
+		{"a user approver is out of scope", node([]string{"192.168.0.0/24"}), nil},
+		{"exit routes need the exit approver", node([]string{"0.0.0.0/0", "::/0"}, "tag:exit"), []string{"0.0.0.0/0", "::/0"}},
+		{"a route approver does not approve exit", node([]string{"0.0.0.0/0"}, "tag:router"), nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tt.want, tagApprovedRoutes(t, policy, tt.node))
+		})
+	}
 }

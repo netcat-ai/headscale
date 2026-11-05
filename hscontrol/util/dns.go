@@ -72,61 +72,36 @@ func ValidateUsername(username string) error {
 	return nil
 }
 
-// generateMagicDNSRootDomains generates a list of DNS entries to be included in [tailcfg.DNSConfig.Routes] in [tailcfg.MapResponse].
-// This list of reverse DNS entries instructs the OS on what subnets and domains the Tailscale embedded DNS
-// server (listening in 100.100.100.100 udp/53) should be used for.
-//
-// Tailscale.com includes in the list:
-// - the [types.DNSConfig.BaseDomain] of the user
-// - the reverse DNS entry for IPv6 (0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa., see below more on IPv6)
-// - the reverse DNS entries for the IPv4 subnets covered by the user's `IPPrefix`.
-//   In the public SaaS this is [64-127].100.in-addr.arpa.
-//
-// The main purpose of this function is then generating the list of IPv4 entries. For the 100.64.0.0/10, this
-// is clear, and could be hardcoded. But we are allowing any range as `IPPrefix`, so we need to find out the
-// subnets when we have 172.16.0.0/16 (i.e., [0-255].16.172.in-addr.arpa.), or any other subnet.
-//
-// How IN-ADDR.ARPA domains work is defined in RFC1035 (section 3.5). Tailscale.com seems to adhere to this,
-// and do not make use of RFC2317 ("Classless IN-ADDR.ARPA delegation") - hence generating the entries for the next
-// class block only.
-
-// GenerateIPv4DNSRootDomain generates the IPv4 reverse DNS root domains.
-// From the netmask we can find out the wildcard bits (the bits that are not set in the netmask).
-// This allows us to then calculate the subnets included in the subsequent class block and generate the entries.
+// GenerateIPv4DNSRootDomain returns the in-addr.arpa. names that route reverse
+// lookups for ipPrefix to MagicDNS ([tailcfg.DNSConfig.Routes]). Reverse zones
+// split on octets (RFC 1035 section 3.5) and Tailscale does not delegate
+// classlessly (RFC 2317), so a prefix ending inside an octet yields one name
+// per value of that octet, and an octet-aligned prefix yields one name.
 func GenerateIPv4DNSRootDomain(ipPrefix netip.Prefix) []dnsname.FQDN {
-	// Conversion to the std lib [net.IPNet], a bit easier to operate
-	netRange := netipx.PrefixIPNet(ipPrefix)
+	// Config prefixes keep their host bits, which would shift the range.
+	netRange := netipx.PrefixIPNet(ipPrefix.Masked())
 	maskBits, _ := netRange.Mask.Size()
 
-	// lastOctet is the last IP byte covered by the mask
+	// lastOctet indexes the octet the mask ends in.
 	lastOctet := maskBits / ByteSize
 
 	// wildcardBits is the number of bits not under the mask in the lastOctet
 	wildcardBits := ByteSize - maskBits%ByteSize
 
-	// A mask covering the full address width (an IPv4 /32) leaves no wildcard
-	// octet, so lastOctet would index past the address. Emit the single
-	// reverse-DNS name for that exact address instead of panicking.
-	if lastOctet >= len(netRange.IP) {
-		rdnsSlice := make([]string, 0, len(netRange.IP)+1)
-		for _, v := range slices.Backward(netRange.IP) {
-			rdnsSlice = append(rdnsSlice, strconv.FormatUint(uint64(v), 10))
+	// An aligned mask ends on an octet boundary: one name for the last masked
+	// octet covers all 256 children. A /0 masks no octet.
+	if maskBits%ByteSize == 0 {
+		if maskBits == 0 {
+			return []dnsname.FQDN{"in-addr.arpa."}
 		}
 
-		rdnsSlice = append(rdnsSlice, "in-addr.arpa.")
-
-		fqdn, err := dnsname.ToFQDN(strings.Join(rdnsSlice, "."))
-		if err != nil {
-			return nil
-		}
-
-		return []dnsname.FQDN{fqdn}
+		lastOctet--
+		wildcardBits = 0
 	}
 
-	// minVal is the value in the lastOctet byte of the IP
-	// maxVal is basically 2^wildcardBits - i.e., the value when all the wildcardBits are set to 1
+	// maxVal is minVal with every wildcard bit set.
 	minVal := uint(netRange.IP[lastOctet])
-	maxVal := (minVal + 1<<uint(wildcardBits)) - 1 //nolint:gosec // wildcardBits is always < 8, no overflow
+	maxVal := (minVal + 1<<uint(wildcardBits)) - 1 //nolint:gosec // wildcardBits is in [0, 7]
 
 	// here we generate the base domain (e.g., 100.in-addr.arpa., 16.172.in-addr.arpa., etc.)
 	rdnsSlice := []string{}

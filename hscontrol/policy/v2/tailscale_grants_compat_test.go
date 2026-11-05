@@ -69,6 +69,7 @@ func buildGrantsNodesFromCapture(
 	for _, nodeDef := range tf.Topology.Nodes {
 		node := &types.Node{
 			ID:        types.NodeID(autoID), //nolint:gosec
+			Hostname:  nodeDef.Hostname,
 			GivenName: nodeDef.Hostname,
 			IPv4:      ptrAddr(nodeDef.IPv4),
 			IPv6:      ptrAddr(nodeDef.IPv6),
@@ -140,19 +141,7 @@ func loadGrantTestFile(t *testing.T, path string) *testcapture.Capture {
 
 // Skip categories document WHY tests are expected to differ from Tailscale SaaS.
 // Tests are grouped by root cause.
-//
-//	USER_PASSKEY_WILDCARD - 2 tests: user:*@passkey wildcard pattern not supported
-//
-// Total: 2 tests skipped, ~246 tests expected to pass.
 var grantSkipReasons = map[string]string{
-	// USER_PASSKEY_WILDCARD (2 tests)
-	//
-	// Tailscale SaaS policies can use user:*@passkey as a wildcard matching
-	// all passkey-authenticated users. headscale does not support passkey
-	// authentication and has no equivalent for this wildcard pattern.
-	"grant-k20": "USER_PASSKEY_WILDCARD: src=user:*@passkey not supported in headscale",
-	"grant-k21": "USER_PASSKEY_WILDCARD: dst=user:*@passkey not supported in headscale",
-
 	// SaaS lists contiguous source addresses one by one and writes
 	// autogroup:internet as address ranges; headscale merges sources into
 	// ranges and writes the internet as prefixes. The address sets match;
@@ -168,6 +157,22 @@ var grantSkipReasons = map[string]string{
 	"via-grant-v60": "FILTER_ADDRESS_FORM: same addresses, different wire form and rule order",
 	"via-grant-v61": "FILTER_ADDRESS_FORM: same addresses, different wire form",
 	"via-grant-v62": "FILTER_ADDRESS_FORM: same addresses, different wire form",
+
+	// Checks keyed <test_id>/<node>/filter: a listed check that matches
+	// fails, so a fix must delete its entry. Contiguous pinned addresses;
+	// TestViaGrantHACompat compares these filters by address.
+	"via-grant-v64/client-a/filter":  srcAddressForm,
+	"via-grant-v64/client-b/filter":  srcAddressForm,
+	"via-grant-v64/plain/filter":     srcAddressForm,
+	"via-grant-v64/srv/filter":       srcAddressForm,
+	"via-grant-v64/via-empty/filter": srcAddressForm,
+	"via-grant-v64/via-r/filter":     srcAddressForm,
+	"via-grant-v65/client-a/filter":  srcAddressForm,
+	"via-grant-v65/client-b/filter":  srcAddressForm,
+	"via-grant-v65/plain/filter":     srcAddressForm,
+	"via-grant-v65/srv/filter":       srcAddressForm,
+	"via-grant-v65/via-empty/filter": srcAddressForm,
+	"via-grant-v65/via-r/filter":     srcAddressForm,
 }
 
 // TestGrantsCompat is a data-driven test that loads all GRANT-*.json
@@ -217,62 +222,13 @@ func TestGrantsCompat(t *testing.T) {
 			policyJSON := convertPolicyUserEmails(tf.Input.FullPolicy)
 
 			if tf.Input.APIResponseCode == 400 || tf.Error {
-				testGrantError(t, policyJSON, tf)
+				testCompatRefusal(t, grantSkipReasons, tf)
 				return
 			}
 
 			testGrantSuccess(t, policyJSON, tf, users, nodes)
 		})
 	}
-}
-
-// testGrantError verifies that an invalid policy produces the expected error.
-func testGrantError(t *testing.T, policyJSON []byte, tf *testcapture.Capture) {
-	t.Helper()
-
-	wantMsg := ""
-	if tf.Input.APIResponseBody != nil {
-		wantMsg = tf.Input.APIResponseBody.Message
-	}
-
-	pol, err := unmarshalPolicy(policyJSON)
-	if err != nil {
-		// Parse-time error
-		if wantMsg != "" {
-			assertGrantErrorContains(t, err, wantMsg, tf.TestID)
-		}
-
-		return
-	}
-
-	err = pol.validate()
-	if err != nil {
-		// Validation error
-		if wantMsg != "" {
-			assertGrantErrorContains(t, err, wantMsg, tf.TestID)
-		}
-
-		return
-	}
-
-	t.Errorf("%s: expected error (api_response_code=400) but policy parsed and validated successfully; want message: %q",
-		tf.TestID, wantMsg)
-}
-
-// assertGrantErrorContains requires that headscale's error contains
-// the Tailscale SaaS error message exactly. Divergence means an
-// emitter needs to be aligned, not papered over with a translation
-// table.
-func assertGrantErrorContains(t *testing.T, err error, wantMsg string, testID string) {
-	t.Helper()
-
-	errStr := err.Error()
-	if strings.Contains(errStr, wantMsg) {
-		return
-	}
-
-	t.Errorf("%s: error message mismatch\n  tailscale wants: %q\n  headscale got:   %q",
-		testID, wantMsg, errStr)
 }
 
 // testGrantSuccess verifies that a valid policy produces the expected
@@ -292,37 +248,47 @@ func testGrantSuccess(
 	err = pol.validate()
 	require.NoError(t, err, "%s: policy should validate successfully", tf.TestID)
 
+	// The manager adds the global merge and its caches on top of the
+	// per-node compile; nodes get their filter from it.
+	pm, err := NewPolicyManager(policyJSON, users, nodes.ViewSlice())
+	require.NoError(t, err, "%s: policy manager should load the policy", tf.TestID)
+
+	// EquateEmpty treats nil and empty slices as equal since Tailscale's
+	// JSON null -> nil, headscale may return empty slice.
+	opts := append(cmpOptions(), cmpopts.EquateEmpty())
+
 	for nodeName, capture := range tf.Captures {
 		t.Run(nodeName, func(t *testing.T) {
 			node := findGrantsNode(nodes, nodeName)
 			require.NotNilf(t, node,
 				"golden node %s not found in test setup", nodeName)
 
-			// Compile headscale filter rules for this node
-			gotRules := pol.compileFilterRulesForNode(
-				users,
-				node.View(),
-				nodes.ViewSlice(),
-			)
-
-			gotRules = policyutil.ReduceFilterRules(node.View(), gotRules)
-
 			wantRules := capture.PacketFilterRules
 
-			// Compare headscale output against Tailscale expected output.
-			// The diff labels show (-tailscale +headscale) to make clear
-			// which side produced which output.
-			// EquateEmpty treats nil and empty slices as equal since
-			// Tailscale's JSON null -> nil, headscale may return empty slice.
-			opts := append(cmpOptions(), cmpopts.EquateEmpty())
-			if diff := cmp.Diff(wantRules, gotRules, opts...); diff != "" {
-				t.Errorf(
-					"%s/%s: filter rules mismatch (-tailscale +headscale):\n%s",
-					tf.TestID,
-					nodeName,
-					diff,
+			compatCheck(t, grantSkipReasons, tf.TestID+"/"+nodeName+"/filter", func() string {
+				gotRules := policyutil.ReduceFilterRules(
+					node.View(),
+					pol.compileFilterRulesForNode(users, node.View(), nodes.ViewSlice()),
+					nodeAddrSet(nodes.ViewSlice()),
 				)
-			}
+
+				pmRules, err := pm.FilterForNode(node.View())
+				if err != nil {
+					return err.Error()
+				}
+
+				var diffs []string
+
+				if diff := cmp.Diff(wantRules, gotRules, opts...); diff != "" {
+					diffs = append(diffs, "filter rules mismatch (-tailscale +headscale):\n"+diff)
+				}
+
+				if diff := cmp.Diff(wantRules, pmRules, opts...); diff != "" {
+					diffs = append(diffs, "policy manager filter rules mismatch (-tailscale +headscale):\n"+diff)
+				}
+
+				return strings.Join(diffs, "\n")
+			})
 		})
 	}
 }

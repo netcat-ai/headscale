@@ -68,17 +68,17 @@ func TestTailNode(t *testing.T) {
 			dnsConfig:  &tailcfg.DNSConfig{},
 			baseDomain: "",
 			want: &tailcfg.Node{
-				Name:              "empty",
-				StableID:          "0",
-				HomeDERP:          0,
-				Hostinfo:          hiview(tailcfg.Hostinfo{}),
-				MachineAuthorized: true,
+				Name:     "empty",
+				StableID: "0",
+				HomeDERP: 0,
+				Hostinfo: hiview(tailcfg.Hostinfo{}),
 
 				CapMap: tailcfg.NodeCapMap{
-					nodecap.Admin:             []tailcfg.RawMessage{},
-					nodecap.SSH:               []tailcfg.RawMessage{},
-					nodecap.FileSharing:       []tailcfg.RawMessage{},
-					nodecap.DefaultAutoUpdate: []tailcfg.RawMessage{tailcfg.RawMessage("false")},
+					nodecap.Admin:                   []tailcfg.RawMessage{},
+					nodecap.SSH:                     []tailcfg.RawMessage{},
+					nodecap.FileSharing:             []tailcfg.RawMessage{},
+					nodecap.DefaultAutoUpdate:       []tailcfg.RawMessage{tailcfg.RawMessage("false")},
+					nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 				},
 			},
 			wantErr: false,
@@ -132,16 +132,13 @@ func TestTailNode(t *testing.T) {
 				),
 				KeyExpiry: expire,
 
-				Machine: mustMK(
-					"mkey:f08305b4ee4250b95a70f3b7504d048d75d899993c624a26d422c67af0422507",
-				),
 				DiscoKey: mustDK(
 					"discokey:cf7b0fd05da556fdc3bab365787b506fd82d64a70745db70e00e86c1b1c03084",
 				),
 				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 				AllowedIPs: []netip.Prefix{
-					tsaddr.AllIPv4(),
 					netip.MustParsePrefix("100.64.0.1/32"),
+					tsaddr.AllIPv4(),
 					netip.MustParsePrefix("192.168.0.0/24"),
 					tsaddr.AllIPv6(),
 				},
@@ -161,13 +158,12 @@ func TestTailNode(t *testing.T) {
 
 				Tags: []string{},
 
-				MachineAuthorized: true,
-
 				CapMap: tailcfg.NodeCapMap{
-					nodecap.Admin:             []tailcfg.RawMessage{},
-					nodecap.SSH:               []tailcfg.RawMessage{},
-					nodecap.FileSharing:       []tailcfg.RawMessage{},
-					nodecap.DefaultAutoUpdate: []tailcfg.RawMessage{tailcfg.RawMessage("false")},
+					nodecap.Admin:                   []tailcfg.RawMessage{},
+					nodecap.SSH:                     []tailcfg.RawMessage{},
+					nodecap.FileSharing:             []tailcfg.RawMessage{},
+					nodecap.DefaultAutoUpdate:       []tailcfg.RawMessage{tailcfg.RawMessage("false")},
+					nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 				},
 			},
 			wantErr: false,
@@ -182,17 +178,17 @@ func TestTailNode(t *testing.T) {
 			baseDomain: "example.com",
 			want: &tailcfg.Node{
 				// a node name should have a dot appended
-				Name:              "minimal.example.com.",
-				StableID:          "0",
-				HomeDERP:          0,
-				Hostinfo:          hiview(tailcfg.Hostinfo{}),
-				MachineAuthorized: true,
+				Name:     "minimal.example.com.",
+				StableID: "0",
+				HomeDERP: 0,
+				Hostinfo: hiview(tailcfg.Hostinfo{}),
 
 				CapMap: tailcfg.NodeCapMap{
-					nodecap.Admin:             []tailcfg.RawMessage{},
-					nodecap.SSH:               []tailcfg.RawMessage{},
-					nodecap.FileSharing:       []tailcfg.RawMessage{},
-					nodecap.DefaultAutoUpdate: []tailcfg.RawMessage{tailcfg.RawMessage("false")},
+					nodecap.Admin:                   []tailcfg.RawMessage{},
+					nodecap.SSH:                     []tailcfg.RawMessage{},
+					nodecap.FileSharing:             []tailcfg.RawMessage{},
+					nodecap.DefaultAutoUpdate:       []tailcfg.RawMessage{tailcfg.RawMessage("false")},
+					nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 				},
 			},
 			wantErr: false,
@@ -276,10 +272,11 @@ func TestTailNodeBaselineGates(t *testing.T) {
 				AutoUpdate: types.AutoUpdateConfig{Enabled: false},
 			},
 			want: tailcfg.NodeCapMap{
-				nodecap.Admin:             []tailcfg.RawMessage{},
-				nodecap.SSH:               []tailcfg.RawMessage{},
-				nodecap.FileSharing:       []tailcfg.RawMessage{},
-				nodecap.DefaultAutoUpdate: autoUpdate(false),
+				nodecap.Admin:                   []tailcfg.RawMessage{},
+				nodecap.SSH:                     []tailcfg.RawMessage{},
+				nodecap.FileSharing:             []tailcfg.RawMessage{},
+				nodecap.DefaultAutoUpdate:       autoUpdate(false),
+				nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 			},
 		},
 		{
@@ -289,9 +286,10 @@ func TestTailNodeBaselineGates(t *testing.T) {
 				AutoUpdate: types.AutoUpdateConfig{Enabled: false},
 			},
 			want: tailcfg.NodeCapMap{
-				nodecap.Admin:             []tailcfg.RawMessage{},
-				nodecap.SSH:               []tailcfg.RawMessage{},
-				nodecap.DefaultAutoUpdate: autoUpdate(false),
+				nodecap.Admin:                   []tailcfg.RawMessage{},
+				nodecap.SSH:                     []tailcfg.RawMessage{},
+				nodecap.DefaultAutoUpdate:       autoUpdate(false),
+				nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 			},
 		},
 		{
@@ -301,10 +299,11 @@ func TestTailNodeBaselineGates(t *testing.T) {
 				AutoUpdate: types.AutoUpdateConfig{Enabled: true},
 			},
 			want: tailcfg.NodeCapMap{
-				nodecap.Admin:             []tailcfg.RawMessage{},
-				nodecap.SSH:               []tailcfg.RawMessage{},
-				nodecap.FileSharing:       []tailcfg.RawMessage{},
-				nodecap.DefaultAutoUpdate: autoUpdate(true),
+				nodecap.Admin:                   []tailcfg.RawMessage{},
+				nodecap.SSH:                     []tailcfg.RawMessage{},
+				nodecap.FileSharing:             []tailcfg.RawMessage{},
+				nodecap.DefaultAutoUpdate:       autoUpdate(true),
+				nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 			},
 		},
 		{
@@ -315,10 +314,11 @@ func TestTailNodeBaselineGates(t *testing.T) {
 				},
 			},
 			want: tailcfg.NodeCapMap{
-				nodecap.Admin:             []tailcfg.RawMessage{},
-				nodecap.SSH:               []tailcfg.RawMessage{},
-				nodecap.HTTPS:             []tailcfg.RawMessage{},
-				nodecap.DefaultAutoUpdate: autoUpdate(false),
+				nodecap.Admin:                   []tailcfg.RawMessage{},
+				nodecap.SSH:                     []tailcfg.RawMessage{},
+				nodecap.HTTPS:                   []tailcfg.RawMessage{},
+				nodecap.DefaultAutoUpdate:       autoUpdate(false),
+				nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 			},
 		},
 		{
@@ -328,9 +328,10 @@ func TestTailNodeBaselineGates(t *testing.T) {
 				AutoUpdate: types.AutoUpdateConfig{Enabled: true},
 			},
 			want: tailcfg.NodeCapMap{
-				nodecap.Admin:             []tailcfg.RawMessage{},
-				nodecap.SSH:               []tailcfg.RawMessage{},
-				nodecap.DefaultAutoUpdate: autoUpdate(true),
+				nodecap.Admin:                   []tailcfg.RawMessage{},
+				nodecap.SSH:                     []tailcfg.RawMessage{},
+				nodecap.DefaultAutoUpdate:       autoUpdate(true),
+				nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 			},
 		},
 	}
@@ -398,11 +399,9 @@ func TestTailNodeDisableIPv4(t *testing.T) {
 			name:     "cap_keeps_advertised_subnet_route",
 			hasCap:   true,
 			approved: []netip.Prefix{subnet},
-			// AllowedIPs is sorted by netip.Prefix.Compare so IPv4
-			// sorts before IPv6.
 			wantAllowed: []netip.Prefix{
-				subnet,
 				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				subnet,
 			},
 			wantPrimary: []netip.Prefix{subnet},
 			wantAddrs:   []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::1/128")},
