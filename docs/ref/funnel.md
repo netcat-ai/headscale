@@ -129,7 +129,7 @@ mkdir -p /tmp/headscale-funnel-bin
 go build -o /tmp/headscale-funnel-bin/headscale ./cmd/headscale
 go build -o /tmp/headscale-funnel-bin/tailscale tailscale.com/cmd/tailscale
 go build -o /tmp/headscale-funnel-bin/tailscaled tailscale.com/cmd/tailscaled
-python3 integration/funnel_native.py --bin-dir /tmp/headscale-funnel-bin --output /tmp/funnel-report.json
+sudo python3 integration/funnel_native.py --bin-dir /tmp/headscale-funnel-bin --output /tmp/funnel-report.json
 ```
 
 To validate literal port 443 in Apple Container, cross-compile these binaries
@@ -142,6 +142,11 @@ Python 3.11+, OpenSSL and curl. Run:
 container exec headscale-funnel-e2e python3 /harness/funnel_native.py \
   --bin-dir /bins --listen-port 443 --output /artifacts/report.json
 ```
+
+The pinned native client's enablement flow checks Funnel access on port 443,
+even when a different TCP forwarding port is requested. This harness therefore
+defaults to literal port 443, including in GitHub Actions, rather than a random
+high port. The container is the recommended way to isolate that privileged bind.
 
 The harness does not alter the workstation's Tailscale daemon. Its local CA and
 credentials are never exported. Public DNS and real CA issuance need separate

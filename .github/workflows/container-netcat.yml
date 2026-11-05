@@ -40,7 +40,7 @@ jobs:
           go build -o "$RUNNER_TEMP/funnel-bin/headscale" ./cmd/headscale
           go build -o "$RUNNER_TEMP/funnel-bin/tailscale" tailscale.com/cmd/tailscale
           go build -o "$RUNNER_TEMP/funnel-bin/tailscaled" tailscale.com/cmd/tailscaled
-          python3 integration/funnel_native.py --bin-dir "$RUNNER_TEMP/funnel-bin" --output "$RUNNER_TEMP/funnel-report.json"
+          sudo "$(command -v python3)" integration/funnel_native.py --bin-dir "$RUNNER_TEMP/funnel-bin" --listen-port 443 --output "$RUNNER_TEMP/funnel-report.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

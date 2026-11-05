@@ -3,7 +3,8 @@
 
 Build the three binaries from this checkout's module pins, then run:
   python3 integration/funnel_native.py --bin-dir /tmp/funnel-bin --output /tmp/funnel-report.json
-Add --listen-port 443 to exercise that exact port when available.
+The native Funnel CLI's enablement check requires port 443. Run in the isolated
+container, or with permission to bind that port on the local test host.
 All credentials and process logs live in a private temporary directory and are
 removed even on failure. The JSON artifact contains checks and binary hashes.
 """
@@ -33,7 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bin-dir', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--listen-port', type=int, default=0)
+    parser.add_argument('--listen-port', type=int, default=443)
     parser.add_argument('--transport-only', action='store_true')
     args = parser.parse_args()
     bins = args.bin_dir.resolve()
