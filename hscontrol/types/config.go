@@ -169,6 +169,13 @@ type Config struct {
 	Tuning Tuning
 }
 
+// FunnelConfig enables an ingress on the main TLS listener. StateDir contains
+// the embedded client's private identity and must not be shared by instances.
+type FunnelConfig struct {
+	Enabled  bool
+	StateDir string
+}
+
 type DNSConfig struct {
 	MagicDNS         bool   `mapstructure:"magic_dns"`
 	BaseDomain       string `mapstructure:"base_domain"`
@@ -178,6 +185,7 @@ type DNSConfig struct {
 	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
 	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
 	Certificates     CertificatesConfig
+	Funnel           FunnelConfig
 }
 
 // CertificatesConfig lets nodes get TLS certificates for their MagicDNS
@@ -1661,6 +1669,34 @@ func LoadServerConfig() (*Config, error) {
 		}
 	}
 
+	if viper.IsSet("funnel.enabled") || viper.IsSet("funnel.state_dir") {
+		v.Add(&ConfigError{Reason: "funnel configuration moved under dns: use dns.funnel.enabled and dns.funnel.state_dir"})
+	}
+	dnsConfig.Funnel = FunnelConfig{
+		Enabled:  viper.GetBool("dns.funnel.enabled"),
+		StateDir: util.AbsolutePathFromConfigPath(viper.GetString("dns.funnel.state_dir")),
+	}
+	if dnsConfig.Funnel.Enabled {
+		if !strings.HasPrefix(serverURL, "https://") || !dnsConfig.MagicDNS || !dnsConfig.Certificates.Enabled {
+			v.Add(&ConfigError{Reason: "funnel requires an HTTPS server_url, MagicDNS and dns.certificates.enabled"})
+		}
+		if viper.GetString("dns.funnel.state_dir") == "" {
+			v.Add(&ConfigError{Reason: "dns.funnel.state_dir is required to persist the managed ingress identity"})
+		}
+		_, listenPort, listenErr := net.SplitHostPort(viper.GetString("listen_addr"))
+		controlURL, parseErr := url.Parse(serverURL)
+		if listenErr != nil || parseErr != nil {
+			v.Add(&ConfigError{Reason: "funnel requires a valid HTTPS server_url and listen_addr"})
+		} else {
+			publicPort := controlURL.Port()
+			if publicPort == "" {
+				publicPort = "443"
+			}
+			if listenPort == "0" || listenPort != publicPort {
+				v.Add(&ConfigError{Reason: "funnel requires listen_addr and server_url to use the same fixed TLS port"})
+			}
+		}
+	}
 	err = v.Err()
 	if err != nil {
 		return nil, err

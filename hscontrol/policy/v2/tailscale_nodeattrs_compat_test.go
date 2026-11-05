@@ -125,8 +125,6 @@ func parsePrefixes(t *testing.T, name string, s []string) []netip.Prefix {
 //
 //	IPPOOL_ALLOCATOR — `ipPool` is parsed but the allocator that
 //	    consumes it is not yet implemented.
-//	FUNNEL_NOT_SUPPORTED — `funnel` cap is rejected pending the DNS /
-//	    ACME machinery the feature requires.
 //	NO_USER_ROLES — `autogroup:admin` and `autogroup:owner` depend on
 //	    user-role and tailnet-ownership concepts headscale does not
 //	    model.
@@ -136,9 +134,6 @@ var nodeAttrsSkipReasons = map[string]string{
 	"nodeattrs-ippool-g3-mixed":            "IPPOOL_ALLOCATOR",
 	"nodeattrs-target-a10-autogroup-admin": "NO_USER_ROLES: autogroup:admin",
 	"nodeattrs-target-a11-autogroup-owner": "NO_USER_ROLES: autogroup:owner",
-	"nodeattrs-attr-c1-funnel":             "FUNNEL_NOT_SUPPORTED",
-	"nodeattrs-funnel-f1-tag":              "FUNNEL_NOT_SUPPORTED",
-	"nodeattrs-funnel-f2-user":             "FUNNEL_NOT_SUPPORTED",
 }
 
 // TestNodeAttrsCompat is a data-driven test that loads every captured

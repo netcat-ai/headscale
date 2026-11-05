@@ -118,6 +118,9 @@ const (
 
 // Network fields.
 const (
+	FunnelTarget    = "target"
+	FunnelEndpoint  = "endpoint"
+	FunnelBytes     = "bytes"
 	EndpointsCount  = "endpoints_count"
 	DERP            = "derp"
 	Hostname        = "hostname"

@@ -303,6 +303,12 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 		// cap stays off the peer view, leaving CapMap empty for most
 		// peers. [policyv2.PeerCapMap] encodes those conditions.
 		tn.CapMap = policyv2.PeerCapMap(peer, peerCapMaps[peer.ID()])
+		if b.mapper.state.IsFunnelNode(peer.ID()) {
+			tn.UnsignedPeerAPIOnly = true
+			tn.AllowedIPs = slices.Clone(tn.Addresses)
+			tn.PrimaryRoutes = nil
+			tn.CapMap = nil
+		}
 
 		tailPeers = append(tailPeers, tn)
 	}

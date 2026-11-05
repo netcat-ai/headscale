@@ -366,6 +366,13 @@ dns:
     # DNS zone the provider writes to. Defaults to base_domain.
     # zone: example.com
 
+  # Public Funnel ingress on the main TLS listener. Requires node certificates,
+  # public DNS and a policy nodeAttrs funnel grant. See docs/ref/funnel.md.
+  # Operational failures disable Funnel while Headscale/DERP keep serving.
+  funnel:
+    enabled: false
+    state_dir: /var/lib/headscale/funnel
+
   # DNS provider for ACME DNS-01 challenges, used by dns.certificates and
   # by tls.acme with challenge_type DNS-01.
   challenge:

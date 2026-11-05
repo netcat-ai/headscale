@@ -141,6 +141,9 @@ type sshCheckPair struct {
 // See [policy.PolicyManager] for policy evaluation and [NodeStore] for the
 // in-memory node cache.
 type State struct {
+	// Only a locally verified, persisted module identity may receive ingress authority.
+	funnelNodeID    atomic.Uint64
+	funnelAvailable atomic.Bool
 	// cfg holds the current Headscale configuration
 	cfg *types.Config
 
@@ -891,7 +894,7 @@ func (s *State) ListNodesByUser(userID types.UserID) views.Slice[types.NodeView]
 // ListPeers retrieves nodes that can communicate with the specified node based on policy.
 func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Slice[types.NodeView] {
 	if len(peerIDs) == 0 {
-		return s.nodeStore.ListPeers(nodeID)
+		return s.funnelPeers(nodeID)
 	}
 
 	// Incremental updates (NodeAdded, NodeChanged) name the peers involved.
@@ -907,7 +910,7 @@ func (s *State) ListPeers(nodeID types.NodeID, peerIDs ...types.NodeID) views.Sl
 
 	// Adjacency is built from node pairs, so it never contains the
 	// recipient: a change batch naming it cannot return it as its own peer.
-	for _, peer := range s.nodeStore.ListPeers(nodeID).All() {
+	for _, peer := range s.funnelPeers(nodeID).All() {
 		if _, exists := nodeIDSet[peer.ID()]; exists {
 			filteredNodes = append(filteredNodes, peer)
 		}
@@ -1302,7 +1305,11 @@ func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 
 // FilterForNode returns filter rules for a specific node, handling autogroup:self per-node.
 func (s *State) FilterForNode(node types.NodeView) ([]tailcfg.FilterRule, error) {
-	return s.polMan.FilterForNode(node)
+	rules, err := s.polMan.FilterForNode(node)
+	if err != nil {
+		return nil, err
+	}
+	return s.funnelFilters(node, rules)
 }
 
 // MatchersForNode returns matchers for peer relationship determination (unreduced).
@@ -1314,7 +1321,7 @@ func (s *State) MatchersForNode(node types.NodeView) ([]matcher.Match, error) {
 // for merging into [tailcfg.Node.CapMap] when the node is rendered as self or
 // as someone else's peer.
 func (s *State) NodeCapMap(id types.NodeID) tailcfg.NodeCapMap {
-	return s.polMan.NodeCapMap(id)
+	return s.funnelNodeCaps(id, s.polMan.NodeCapMap(id))
 }
 
 // NodeCapMaps returns a snapshot of every node's policy CapMap so

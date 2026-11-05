@@ -1,7 +1,7 @@
 name: Netcat container
 on:
   push:
-    branches: [main, codex/tencentcloud-dns]
+    branches: [main, codex/tencentcloud-dns, codex/headscale-funnel]
     paths: ["**/*.go", "go.*", "*.nix", "flake.lock", "flakehashes.json", ".github/workflows/container-netcat.yml", ".github/scripts/verify-netcat-image.py"]
   workflow_dispatch:
 permissions:
@@ -33,6 +33,20 @@ jobs:
         run: |
           go run ./cmd/vendorhash check
           go test ./hscontrol/dns -count=1
+      - name: Verify embedded Funnel with native clients
+        shell: nix develop --fallback --command bash -e {0}
+        run: |
+          mkdir -p "$RUNNER_TEMP/funnel-bin"
+          go build -o "$RUNNER_TEMP/funnel-bin/headscale" ./cmd/headscale
+          go build -o "$RUNNER_TEMP/funnel-bin/tailscale" tailscale.com/cmd/tailscale
+          go build -o "$RUNNER_TEMP/funnel-bin/tailscaled" tailscale.com/cmd/tailscaled
+          python3 integration/funnel_native.py --bin-dir "$RUNNER_TEMP/funnel-bin" --output "$RUNNER_TEMP/funnel-report.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: funnel-acceptance
+          path: ${{ runner.temp }}/funnel-report.json
+          retention-days: 90
       - name: Build and publish immutable candidate
         id: publish
         shell: nix develop --fallback --command bash -e {0}

@@ -102,9 +102,7 @@ var (
 // without the matching server-side machinery would be misleading — nodes
 // would advertise a feature that does not work. Reject at policy load and
 // point operators at the issue.
-var nodeAttrUnsupportedCaps = map[nodecap.Cap]string{
-	nodecap.Funnel: "https://github.com/juanfont/headscale/issues/2527",
-}
+var nodeAttrUnsupportedCaps = map[nodecap.Cap]string{}
 
 // Policy validation errors.
 var (

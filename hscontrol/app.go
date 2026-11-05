@@ -37,6 +37,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/derp"
 	derpServer "github.com/juanfont/headscale/hscontrol/derp/server"
 	"github.com/juanfont/headscale/hscontrol/dns"
+	"github.com/juanfont/headscale/hscontrol/funnel"
 	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -744,8 +745,21 @@ func (h *Headscale) Serve() error {
 	}
 
 	var httpListener net.Listener
+	var funnelServer *funnel.Server
 
-	if tlsConfig != nil {
+	if h.cfg.DNSConfig.Funnel.Enabled && tlsConfig == nil {
+		log.Error().Msg("Funnel unavailable without TLS on the main listener; continuing with the configured Headscale HTTP listener")
+	}
+	if h.cfg.DNSConfig.Funnel.Enabled && tlsConfig != nil {
+		rawListener, listenErr := net.Listen("tcp", h.cfg.Addr)
+		if listenErr != nil {
+			return fmt.Errorf("listen for funnel: %w", listenErr)
+		}
+		funnelServer = funnel.New(rawListener, h.cfg, h.state)
+		defer funnelServer.Close()
+		httpServer.TLSConfig = tlsConfig
+		httpListener = tls.NewListener(funnelServer.Control(), tlsConfig)
+	} else if tlsConfig != nil {
 		httpServer.TLSConfig = tlsConfig
 		httpListener, err = tls.Listen("tcp", h.cfg.Addr, tlsConfig)
 	} else {
@@ -762,6 +776,9 @@ func (h *Headscale) Serve() error {
 	}
 
 	errorGroup.Go(func() error { return httpServer.Serve(httpListener) })
+	if funnelServer != nil {
+		funnelServer.Start(func() { h.Change(change.PolicyChange()) })
+	}
 
 	log.Info().
 		Msgf("listening and serving HTTP on: %s", h.cfg.Addr)
@@ -911,6 +928,9 @@ func (h *Headscale) Serve() error {
 
 				scheduleCancel()
 				h.ephemeralGC.Close()
+				if funnelServer != nil {
+					_ = funnelServer.Close()
+				}
 
 				// Gracefully shut down servers
 				shutdownCtx, cancel := context.WithTimeout(

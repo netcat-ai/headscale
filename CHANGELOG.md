@@ -4,6 +4,16 @@
 
 **Minimum supported Tailscale client version: v1.84.0**
 
+### Embedded Funnel
+
+Opt-in `dns.funnel.enabled` publishes policy-authorized node services through the
+main TLS listener. A persistent, automatically registered ingress identity uses
+Tailscale's PeerAPI-only ingress protocol; application TLS terminates on the
+target. Control HTTP and embedded DERP keep using the same port. See
+[the Funnel reference](docs/ref/funnel.md) for DNS, certificate and policy setup.
+Funnel initialization failures are logged without preventing Headscale and
+embedded DERP from starting; there is no background health monitor or retry loop.
+
 ### v1 REST API replaced; gRPC and Protobuf removed
 
 The v1 REST API now provides an OpenAPI 3.1 specification at
@@ -371,7 +381,7 @@ default for client auto-update. When true, every node's CapMap carries
 `default-auto-update: [true]` so fresh clients pick up the default
 unless they make a local opt-in / opt-out choice.
 
-Policies that use the `funnel` cap, `ipPool` blocks, or
+Policies that use `ipPool` blocks or
 `autogroup:admin` / `autogroup:owner` targets are rejected at load —
 those features depend on machinery headscale does not yet ship.
 
