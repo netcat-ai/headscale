@@ -21,6 +21,7 @@ import (
 	"github.com/libdns/libdns"
 	"github.com/libdns/powerdns"
 	"github.com/libdns/rfc2136"
+	"github.com/libdns/tencentcloud"
 )
 
 // Isolator is implemented by a provider that can answer several names'
@@ -51,18 +52,21 @@ type Provider interface {
 // plus its module; the set is curated because each provider is a
 // dependency to keep current and its quirks become ours.
 var providers = map[string]func() Provider{
-	"acmedns":    func() Provider { return &acmeDNS{served: make(map[string][2]acmeDNSValue)} },
-	"cloudflare": func() Provider { return new(cloudflare.Provider) },
-	"gigahost":   func() Provider { return new(gigahost.Provider) },
-	"hetzner":    func() Provider { return new(hetzner.Provider) },
-	"powerdns":   func() Provider { return new(powerdns.Provider) },
-	"rfc2136":    func() Provider { return new(rfc2136.Provider) },
+	"acmedns":      func() Provider { return &acmeDNS{served: make(map[string][2]acmeDNSValue)} },
+	"cloudflare":   func() Provider { return new(cloudflare.Provider) },
+	"gigahost":     func() Provider { return new(gigahost.Provider) },
+	"hetzner":      func() Provider { return new(hetzner.Provider) },
+	"powerdns":     func() Provider { return new(powerdns.Provider) },
+	"rfc2136":      func() Provider { return new(rfc2136.Provider) },
+	"tencentcloud": func() Provider { return new(tencentCloud) },
 }
 
 var (
-	ErrUnknownProvider = errors.New("unknown DNS provider")
-	ErrProviderConfig  = errors.New("invalid DNS provider configuration")
-	errAcmeDNSAccount  = errors.New("acme-dns needs username, password, subdomain and server_url")
+	ErrUnknownProvider         = errors.New("unknown DNS provider")
+	ErrProviderConfig          = errors.New("invalid DNS provider configuration")
+	errTencentCloudCredentials = errors.New("tencentcloud needs secret_id and secret_key")
+	errTencentCloudTTL         = errors.New("tencentcloud min_ttl must be non-negative and fit in a time.Duration")
+	errAcmeDNSAccount          = errors.New("acme-dns needs username, password, subdomain and server_url")
 	// The CA accepts a value found in a shared record for any of the
 	// names, so a node could publish another's under its own name.
 	errAcmeDNSOneAccount = errors.New("acme-dns with one account answers every name's challenge from one record; " +
@@ -188,6 +192,52 @@ func jsonFields(provider Provider) map[string]reflect.Kind {
 	}
 
 	return fields
+}
+
+// tencentCloud supplies JSON configuration names for the upstream provider,
+// whose exported credential fields have no JSON tags. The embedded provider
+// performs all API operations; credentials retain the normal _path support.
+type tencentCloud struct {
+	tencentcloud.Provider `json:"-"`
+	APISecretID           string `json:"secret_id"`
+	APISecretKey          string `json:"secret_key"`
+	APISessionToken       string `json:"session_token"`
+	APIRegion             string `json:"region"`
+	MinTTL                int64  `json:"min_ttl"`
+}
+
+func (p *tencentCloud) validate() error {
+	if strings.TrimSpace(p.APISecretID) == "" || strings.TrimSpace(p.APISecretKey) == "" {
+		return errTencentCloudCredentials
+	}
+	if p.MinTTL < 0 || p.MinTTL > (1<<63-1)/int64(time.Second) {
+		return errTencentCloudTTL
+	}
+	if p.MinTTL == 0 {
+		p.MinTTL = 600 // DNSPod's free plan requires at least ten minutes.
+	}
+
+	p.Provider = tencentcloud.Provider{
+		SecretId:     p.APISecretID,
+		SecretKey:    p.APISecretKey,
+		SessionToken: p.APISessionToken,
+		Region:       p.APIRegion,
+	}
+
+	return nil
+}
+
+// AppendRecords returns the adjusted records so challenge cleanup and cache
+// waiting use the TTL that was actually sent to DNSPod.
+func (p *tencentCloud) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+	adjusted := make([]libdns.Record, len(records))
+	for i, record := range records {
+		rr := record.RR()
+		rr.TTL = max(rr.TTL, time.Duration(p.MinTTL)*time.Second)
+		adjusted[i] = rr
+	}
+
+	return p.Provider.AppendRecords(ctx, zone, adjusted)
 }
 
 // acmeDNSSpacing separates updates to a registration. acme-dns stamps an
